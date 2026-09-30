@@ -252,6 +252,14 @@ def test_hdi_bounds_handles_sampling_dims_only():
     assert float(lower) < float(upper)
 
 
+@pytest.mark.parametrize("prob", [0.0, 1.0, -0.1, 1.5])
+def test_hdi_bounds_rejects_probability_outside_open_unit_interval(asymmetric_draws, prob):
+    with pytest.raises(ValueError) as exc_info:
+        hdi_bounds(asymmetric_draws, prob=prob)
+
+    assert str(exc_info.value) == f"hdi_bounds() prob must be in (0, 1), got {prob}."
+
+
 def test_hdi_bounds_rejects_an_unnamed_dataarray(rng):
     da = xr.DataArray(rng.standard_normal((2, 50, 3)), dims=["chain", "draw", "term"])
     with pytest.raises(ValueError, match="named DataArray"):
