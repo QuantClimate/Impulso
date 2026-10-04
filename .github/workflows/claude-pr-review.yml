@@ -1,0 +1,43 @@
+name: Claude PR review
+
+# Runs the `pr-reviewer` agent (.claude/agents/pr-reviewer.md) on a pull request
+# when a comment mentions `@claude-pr-review`. Text after the mention reaches the
+# agent as extra instructions. The action loads `.claude/` from the PR's base
+# branch, so agent changes take effect once merged into `main`.
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    # Only PR comments that mention the agent, and only from the maintainer:
+    # the run is billed to a personal Claude subscription.
+    if: >-
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@claude-pr-review') &&
+      github.actor == 'thomaspinder'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      id-token: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Run the reviewer agent
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          trigger_phrase: "@claude-pr-review"
+          claude_args: |
+            --agent pr-reviewer
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr diff:*),Bash(gh pr view:*)"
