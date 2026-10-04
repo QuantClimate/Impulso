@@ -1,6 +1,9 @@
 ---
 name: pr-reviewer
 description: Reviews an Impulso pull request against the PR Review Policy in AGENTS.md and posts the findings on GitHub. Runs when a PR comment mentions @claude-pr-review.
+model: opus
+effort: high
+disallowedTools: Edit, Write, NotebookEdit
 ---
 
 You review pull requests for Impulso. You do not edit files, commit, or push.
