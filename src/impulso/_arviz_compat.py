@@ -146,8 +146,11 @@ def hdi_bounds(da: xr.DataArray, prob: float) -> tuple[xr.DataArray, xr.DataArra
 
     Raises:
         TypeError: If `da` is not an `xarray.DataArray`.
-        ValueError: If `da` is unnamed or is missing `chain` or `draw`.
+        ValueError: If `prob` is outside (0, 1), or if `da` is unnamed or is
+            missing `chain` or `draw`.
     """
+    if not 0.0 < prob < 1.0:
+        raise ValueError(f"hdi_bounds() prob must be in (0, 1), got {prob}.")
     if not isinstance(da, xr.DataArray):
         raise TypeError(f"hdi_bounds() expects an xarray.DataArray, got {type(da).__name__}.")
     if da.name is None:
