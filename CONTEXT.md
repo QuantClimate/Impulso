@@ -142,7 +142,7 @@ An endogenous variable with no data, generated inside the model from its own VAR
 _Avoid_: "missing data" or "unobserved column": nothing is imputed, and a latent series is never passed in. Avoid "state" (state-space vocabulary for a model Impulso does not fit).
 
 **Latent block / stationarity constraint**:
-The latent-on-latent part of the lag coefficients: the latent equations' coefficients on latent lags, across all lags. The observed series are data, so this block alone decides whether a generated path explodes. The stationarity constraint restricts it to the region where its companion matrix has spectral radius below 1. The posterior is the prior truncated to that region, and prior predictive sampling ignores the constraint.
+The latent-on-latent part of the lag coefficients: the latent equations' coefficients on latent lags, across all lags. The observed series are data, so this block alone decides whether a generated path explodes. The stationarity constraint restricts it to the region where its companion matrix has spectral radius below 1, and the posterior is the prior truncated to that region. For one latent series with one lag the block is the latent own lag alone and the region is the interval (−1, 1), so the constraint is a truncated own-lag prior, which prior predictive sampling respects. In every other case it is a Potential, which prior predictive sampling ignores (ADR-0017).
 _Avoid_: "stationary VAR" for the constraint: the observed equations are unconstrained. Avoid "stationarity pretest", which is the unrelated frequentist test run before specification.
 
 **Model evidence (`ModelEvidence`)**:

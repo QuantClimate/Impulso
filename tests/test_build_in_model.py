@@ -1353,9 +1353,8 @@ class TestLatentSeries:
 
         The setup is gentle: a weak loading and a tight prior on the latent
         innovation scale (`_gentle_latent_volatility`). The latent own-lag
-        prior mean is 0, set through `MinnesotaPrior(own_lag_mean=...)`: with
-        the Minnesota mean of 1 this posterior presses against the
-        stationarity boundary and diverges heavily.
+        prior mean is 0, set through `MinnesotaPrior(own_lag_mean=...)`; the
+        default mean of 1 has its own test in `TestTruncatedOwnLag`.
         `build_in_model` starts the latent own-lag inside the stationary
         region and keeps it there, so no `initvals` are passed. The check is
         that sampling runs, no chain freezes and divergences stay a small
@@ -1393,15 +1392,8 @@ class TestLatentSeries:
         assert divergences < 0.1 * draws * chains, f"{divergences} divergences out of {draws * chains}"
         assert np.all(np.isfinite(np.asarray(idata.posterior["latent"])))
 
-    @pytest.mark.parametrize(
-        ("n_lags", "n_latent"),
-        [
-            pytest.param(1, 1, marks=pytest.mark.xfail(strict=True, reason="#395")),
-            (1, 2),
-            (3, 1),
-            (3, 2),
-        ],
-    )
+    @pytest.mark.parametrize("n_lags", [1, 3])
+    @pytest.mark.parametrize("n_latent", [1, 2])
     def test_path_and_joint_logp_across_lag_orders_and_latent_counts(self, rng, n_lags, n_latent):
         """The recursion and the change-of-variables identity hold for any
         lag order and any number of latent series, including the `n_lags == 1`
@@ -1720,9 +1712,10 @@ class _LatentCrossLagPrior:
 class TestLatentModelIsClonable:
     """PyMC's `Model.copy()` and `pm.do` refuse a model with a non-default initial value.
 
-    `build_in_model` therefore sets one for `B` only when the stationary start
-    of the latent rows differs from the prior mean, which is PyMC's default
-    start for a `Normal`.
+    In the Potential cases `build_in_model` therefore sets one for `B` only when
+    the stationary start of the latent rows differs from the prior mean, which
+    is PyMC's default start for a `Normal`. One latent series with `n_lags=1`
+    never sets one (`TestTruncatedOwnLag`).
     """
 
     @staticmethod
@@ -1961,7 +1954,6 @@ class TestTruncatedOwnLag:
     """One latent series with `n_lags == 1`: the latent block is the own lag alone, so the stationary region
     is `|B[0, 0]| < 1`. The own lag is its Minnesota Normal truncated to (-1, 1), and `B` is a `Deterministic`."""
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     def test_b_is_a_deterministic_assembled_from_the_free_block_and_the_own_lag(self, rng):
         from pymc.distributions.transforms import Interval
 
@@ -1982,7 +1974,6 @@ class TestTruncatedOwnLag:
         want[0, 0] = 0.7
         np.testing.assert_allclose(_evaluate(model, point, ["B"])["B"], want)
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     @pytest.mark.parametrize("own_lag", [0.95, 0.999])
     def test_the_gradient_near_the_boundary_is_finite_and_non_zero(self, rng, own_lag):
         model, _ = _one_latent_lag_one_model(rng)
@@ -1991,7 +1982,6 @@ class TestTruncatedOwnLag:
         assert np.all(np.isfinite(grad))
         assert np.all(grad != 0.0)
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     @pytest.mark.parametrize("transformed", [-50.0, 50.0])
     def test_logp_far_out_in_the_transformed_space_is_finite(self, rng, transformed):
         model, _ = _one_latent_lag_one_model(rng)
@@ -2000,7 +1990,6 @@ class TestTruncatedOwnLag:
         point = {**model.initial_point(random_seed=0), value.name: np.float64(transformed)}
         assert np.isfinite(model.compile_logp()(point))
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     def test_every_jittered_start_is_inside_the_region_without_a_retry(self, rng):
         from pymc.sampling.mcmc import _init_jitter
 
@@ -2011,14 +2000,7 @@ class TestTruncatedOwnLag:
         own_lags = np.array([_evaluate(model, point, ["B"])["B"][0, 0] for point in points])
         assert np.abs(own_lags).max() < 1.0
 
-    @pytest.mark.parametrize(
-        "own_lag_mean",
-        [
-            0.0,
-            pytest.param(1.0, marks=pytest.mark.xfail(strict=True, reason="#395")),
-            pytest.param(-0.9, marks=pytest.mark.xfail(strict=True, reason="#395")),
-        ],
-    )
+    @pytest.mark.parametrize("own_lag_mean", [0.0, 1.0, -0.9])
     def test_no_initial_value_and_the_own_lag_starts_at_zero_whatever_its_mean(self, rng, own_lag_mean):
         from impulso.priors import MinnesotaPrior
 
@@ -2031,7 +2013,6 @@ class TestTruncatedOwnLag:
         np.testing.assert_array_equal(_evaluate(model, model.initial_point(random_seed=0), ["B"])["B"], want)
         model.copy()
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     def test_prior_predictive_own_lag_is_truncated(self, rng):
         import pymc as pm
 
@@ -2046,7 +2027,6 @@ class TestTruncatedOwnLag:
         assert np.abs(own_lags).max() < 1.0
         assert own_lags.mean() < 0.95
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     def test_logp_and_dlogp_compile_under_jax(self, rng):
         pytest.importorskip("jax")
         model, _ = _one_latent_lag_one_model(rng)
@@ -2056,12 +2036,11 @@ class TestTruncatedOwnLag:
         assert np.all(np.isfinite(model.compile_dlogp(mode="JAX")(point)))
         assert np.all(model.compile_dlogp(vars=[model["latent_own_lag"]], mode="JAX")(point) != 0.0)
 
-    @pytest.mark.xfail(strict=True, reason="#395")
     @pytest.mark.slow
     @pytest.mark.parametrize("seed", [1, 2, 3])
     def test_default_own_lag_mean_samples_without_a_divergence_storm(self, seed):
         """`test_default_init_samples_with_own_lag_mean_zero`'s setup under Impulso's default own-lag
-        mean of 1, where the Potential gave 212-290 divergent draws of 400 (ADR-0016)."""
+        mean of 1, where the Potential made most draws divergent (ADR-0016)."""
         import arviz as az
         import pymc as pm
 
