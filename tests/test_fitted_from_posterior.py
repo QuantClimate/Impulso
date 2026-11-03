@@ -431,6 +431,32 @@ class TestFromPosteriorAcceptsExogAndStudentT:
         assert isinstance(fitted.error_dist, StudentT)
 
 
+# --------------- Acceptance: truncated latent own lag ---------------
+
+
+class TestFromPosteriorAcceptsTheTruncatedOwnLagLayout:
+    """`build_in_model` with one latent series and `n_lags=1` records `B` as a `Deterministic` assembled from
+    the free block `B_free` and the truncated own lag `latent_own_lag`, both also in the posterior."""
+
+    def test_coefficients_are_the_b_draws_and_the_extra_variables_are_ignored(self, var_data):
+        rng = np.random.default_rng(5)
+        own_lag = rng.uniform(-0.9, 0.9, size=(2, 5))
+        free = 0.2 * rng.standard_normal((2, 5, 3))
+        B = np.concatenate([own_lag[..., None], free], axis=-1).reshape(2, 5, 2, 2)
+        idata = _build_posterior(
+            extra={
+                "B": xr.DataArray(B, dims=["chain", "draw", "var", "coeff"]),
+                "B_free": xr.DataArray(free, dims=["chain", "draw", "B_free_dim_0"]),
+                "latent_own_lag": xr.DataArray(own_lag, dims=["chain", "draw"]),
+            }
+        )
+
+        fitted = FittedVAR.from_posterior(idata, var_data, n_lags=1)
+
+        np.testing.assert_array_equal(fitted.coefficients, B)
+        assert np.isfinite(fitted.forecast(steps=2).median().to_numpy()).all()
+
+
 # --------------- Acceptance: real estimator posteriors ---------------
 
 
