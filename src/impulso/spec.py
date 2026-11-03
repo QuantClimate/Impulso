@@ -1,11 +1,12 @@
 """VAR model specification."""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import numpy as np
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from impulso._arviz_compat import InferenceDataLike
 from impulso._base import ImpulsoBaseModel
@@ -684,7 +685,7 @@ def _register_likelihood(
 def _exog_prior_sigma(
     sigma: np.ndarray,
     x_exog: np.ndarray,
-    scale: float,
+    scale: float | Sequence[float],
     exog_names: Sequence[str] | None = None,
 ) -> np.ndarray:
     """Prior standard deviations for the exogenous coefficients `B_exog`.
@@ -696,15 +697,17 @@ def _exog_prior_sigma(
     on large-scale ones effectively unrestricted. This scales the prior so the
     belief lives in *contribution* space instead:
 
-        sd[i, j] = scale * sigma_i / s_j
+        sd[i, j] = scale_i * sigma_i / s_j
 
     where `sigma_i` is the AR(1) residual standard deviation of endogenous
     variable `i` (the same scale `MinnesotaPrior.build_priors` uses for its lag
     coefficients — see docs/adr/0015) and `s_j` is the sample standard
     deviation of exogenous column `j`. One prior standard deviation of
-    `B_exog[i, j]` then moves variable `i` by `scale` of its own residual
-    standard deviation when regressor `j` moves by one of its own. The default
-    `scale` is deliberately loose (see `VAR.exog_prior_scale`).
+    `B_exog[i, j]` then moves variable `i` by `scale_i` of its own residual
+    standard deviation when regressor `j` moves by one of its own. `scale_i`
+    is `scale` itself when `scale` is a scalar and its `i`-th entry when it is
+    a sequence. The default `scale` is deliberately loose (see
+    `VAR.exog_prior_scale`).
 
     Args:
         sigma: Per-endogenous-variable AR(1) residual standard deviation,
@@ -715,7 +718,9 @@ def _exog_prior_sigma(
         x_exog: Exogenous regressor block of shape `(T_eff, n_exog)`, already
             trimmed to the rows the likelihood sees.
         scale: Multiplier in units of "residual standard deviations of the
-            dependent variable per standard deviation of the regressor".
+            dependent variable per standard deviation of the regressor". A
+            scalar applies to every equation; a sequence gives one entry per
+            equation, in the order of `sigma`.
         exog_names: Optional column names, used only to make the
             constant-column error message readable.
 
@@ -723,6 +728,7 @@ def _exog_prior_sigma(
         Array of shape `(n_vars, n_exog)` of prior standard deviations.
 
     Raises:
+        ValueError: If `scale` is a sequence whose length is not `sigma`'s.
         ValueError: If a column of `x_exog` is exactly constant. `VARData`
             rejects columns that are constant over the whole sample, but
             trimming the first `n_lags` rows can flatten a column that did
@@ -731,6 +737,12 @@ def _exog_prior_sigma(
             intercept, so the coefficient is not identified; the floor below
             would happily hand it a wide prior and hide that.
     """
+    scale_arr = np.asarray(scale, dtype=float)
+    if scale_arr.ndim and scale_arr.shape != sigma.shape:
+        raise ValueError(
+            f"exog_prior_scale must be a scalar or have {sigma.size} entries to match n_vars, got {scale_arr.size}"
+        )
+
     s = x_exog.std(axis=0, ddof=1)
     # Checked before the floor is applied: the floor exists to tame columns with
     # tiny-but-real variation, not to manufacture a scale for columns with none.
@@ -745,7 +757,7 @@ def _exog_prior_sigma(
         )
     peak = np.abs(x_exog).max(axis=0)
     s_eff = np.maximum(s, _EXOG_SD_FLOOR_FRACTION * peak)
-    return scale * np.outer(sigma, 1.0 / s_eff)
+    return scale_arr.reshape(-1, 1) * np.outer(sigma, 1.0 / s_eff)
 
 
 @dataclass(frozen=True)
@@ -820,7 +832,15 @@ class VAR(ImpulsoBaseModel):
             engine uses `Vc = 10e6` on the intercept), and the prior's job here
             is to stop the scale of the regressor from silently setting the
             answer, not to shrink. Lower it to shrink `B_exog` towards zero.
-            Applies only to `VAR.fit`; `prior` governs the lag coefficients.
+            A scalar applies to every equation. A tuple gives one scale per
+            equation, in `endog_names` order, for a caller that needs one
+            equation tight (such as an embedded latent series, which has no
+            data to pull a loose prior back) and the rest loose; its length is
+            checked against the number of endogenous variables when the graph
+            is built. Every entry must be positive and finite. Governs the
+            exogenous block only; `prior` governs the lag coefficients.
+            `VAR.fit`, `VAR.prior_predictive` and `VAR.build_in_model` build
+            the same graph, so it applies to all three.
         error_dist: Observation error distribution — shorthand string
             (`"gaussian"`, the default, or `"student_t"`) or an
             `ErrorDistribution` protocol instance. The string form takes the
@@ -828,9 +848,6 @@ class VAR(ImpulsoBaseModel):
             degrees of freedom; pass `StudentT(nu=5.0)` to fix them. Heavy-
             tailed errors are rejected in combination with time-varying
             volatility.
-            Governs the exogenous block only; `prior` governs the lag
-            coefficients. Both `VAR.fit` and `VAR.prior_predictive` build the
-            same graph, so it applies to either.
     """
 
     lags: int | Literal["aic", "bic", "hq"] = Field(...)
@@ -844,8 +861,16 @@ class VAR(ImpulsoBaseModel):
     # (StochasticVolatility) itself has a discriminated field (dynamics/prior).
     prior: Literal["minnesota"] | MinnesotaPrior | Prior = "minnesota"
     volatility: Literal["constant", "sv"] | Constant | StochasticVolatility | PyMCVolatilityProcess = "constant"
-    exog_prior_scale: float = Field(100.0, gt=0)
+    exog_prior_scale: float | tuple[float, ...] = 100.0
     error_dist: Literal["gaussian", "student_t"] | Gaussian | StudentT | ErrorDistribution = "gaussian"
+
+    @field_validator("exog_prior_scale")
+    @classmethod
+    def _exog_prior_scale_is_positive(cls, value: float | tuple[float, ...]) -> float | tuple[float, ...]:
+        values = value if isinstance(value, tuple) else (value,)
+        if not all(math.isfinite(v) and v > 0 for v in values):
+            raise ValueError(f"exog_prior_scale must be positive and finite, got {value!r}")
+        return value
 
     @model_validator(mode="after")
     def _validate_spec(self) -> Self:

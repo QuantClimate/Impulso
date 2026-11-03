@@ -235,7 +235,6 @@ class TestBuildInModel:
 
         assert handles.B_exog is None
 
-    @pytest.mark.xfail(strict=True, reason="#394")
     def test_per_equation_exog_prior_scale_scales_each_row(self, rng):
         """Row `i` of `B_exog`'s prior sd is `exog_prior_scale[i]` times the row a scale of 1 gives."""
         data = _make_data(rng, n_vars=3, exog_names=["z1", "z2"])
@@ -252,7 +251,6 @@ class TestBuildInModel:
 
         np.testing.assert_allclose(got, np.array([[1.0], [100.0], [5.0]]) * unit)
 
-    @pytest.mark.xfail(strict=True, reason="#394")
     @pytest.mark.parametrize("exog_prior_scale", [(1.0, 2.0), (1.0, 2.0, 3.0, 4.0)])
     def test_exog_prior_scale_of_the_wrong_length_raises(self, rng, exog_prior_scale):
         import pymc as pm
@@ -1338,7 +1336,6 @@ class TestLatentSeries:
         })
         np.testing.assert_allclose(np.ravel(logp), stats.norm(0, 3.0).logpdf([0.4, -1.2]))
 
-    @pytest.mark.xfail(strict=True, reason="#394")
     def test_per_equation_exog_prior_scale_reaches_the_latent_row(self, rng):
         """A tight scale on the latent equation leaves the observed equations on the default."""
         kwargs = _latent_setup(rng)

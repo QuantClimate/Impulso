@@ -340,13 +340,11 @@ class TestExogPriorScaleField:
         with pytest.raises(ValidationError):
             spec.exog_prior_scale = 5.0
 
-    @pytest.mark.xfail(strict=True, reason="#394")
     @pytest.mark.parametrize("bad", [(1.0, 0.0), (1.0, -1.0), (1.0, np.inf), (np.nan,), np.inf])
     def test_rejects_non_positive_or_non_finite_entries(self, bad):
         with pytest.raises(ValidationError, match="exog_prior_scale must be positive and finite"):
             VAR(lags=1, exog_prior_scale=bad)
 
-    @pytest.mark.xfail(strict=True, reason="#394")
     def test_per_equation_scale_round_trips_through_json(self):
         spec = VAR(lags=1, exog_prior_scale=(1.0, 100.0, 5.0))
         restored = VAR.model_validate(spec.model_dump(mode="json"))
@@ -503,7 +501,6 @@ class TestExogPriorWiredIntoModel:
             _exog_prior_sigma(ar1_residual_sd(endog), exog[1:], 5.0),
         )
 
-    @pytest.mark.xfail(strict=True, reason="#394")
     def test_per_equation_knob_reaches_the_graph(self, rng):
         endog = rng.standard_normal((150, 2))
         exog = rng.standard_normal((150, 2)) * np.array([0.01, 250.0])
