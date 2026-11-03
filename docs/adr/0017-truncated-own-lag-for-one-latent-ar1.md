@@ -5,7 +5,7 @@ ADR-0016 keeps a latent block stationary with the `latent_stationarity` Potentia
 For exactly one latent series and `n_lags = 1` the latent block is the 1×1 own lag `B[0, 0]`. Its companion matrix is that number, so the stationary region is the interval `|B[0, 0]| < 1`, and the constraint can be exact and smooth. `build_in_model` then registers three variables in place of the single `Normal` `B`:
 
 - `latent_own_lag`: the own lag's `Normal`, with its Minnesota mean and standard deviation, truncated to (−1, 1). PyMC samples it through its default interval transform.
-- `B_free`: a flat `Normal` over every other lag coefficient, with the Minnesota means and standard deviations of those entries.
+- `B_free`: a one-dimensional `Normal` over every other lag coefficient, with the Minnesota means and standard deviations of those entries.
 - `B`: the `Deterministic` scattered from the two, under its existing name and `(var, coeff)` dims.
 
 No Potential and no initial value are registered in this case. Every other case is unchanged. Without latent series `B` is the single `Normal`. With `n_lags > 1` or several latent series it is the single `Normal` with the Potential and the stationary initial value of ADR-0016.
@@ -16,7 +16,7 @@ No Potential and no initial value are registered in this case. Every other case 
 
 ## Considered options
 
-- **A partial-autocorrelation parametrisation of the general latent block** — deferred to its own issue. Mapping unconstrained variables onto the stationary region of the latent VAR(p) is the general fix for `n_lags > 1` and several latent series, where bounding each own lag does not bound the spectral radius. For one series at lag 1 the partial autocorrelation is the own lag, so that parametrisation reduces to a bounded own lag, which the truncated Normal already is.
+- **A partial-autocorrelation parametrisation of the general latent block** — deferred to its own issue (#397). Mapping unconstrained variables onto the stationary region of the latent VAR(p) is the general fix for `n_lags > 1` and several latent series, where bounding each own lag does not bound the spectral radius. For one series at lag 1 the partial autocorrelation is the own lag, so that parametrisation reduces to a bounded own lag, which the truncated Normal already is.
 - **A smooth penalty on the spectral radius** — rejected. A soft barrier in place of the wall changes the posterior. The truncation is the belief. A penalty moves prior mass inside the region, which nothing in the data asked for.
 - **Sampler guidance alone** — rejected in ADR-0016 already.
 - **ADR-0016's bounded own-lag variable, reconsidered.** ADR-0016 rejected a bounded own lag (`tanh` of a free variable) on cost. For this case its costs do not apply or are worth paying. The truncated Normal is the Minnesota Normal on the region, so the latent row's prior does not change, where a `tanh` of a Normal would change it. It adds no parameters: `B_free` and `latent_own_lag` together have as many entries as `B`. `B` survives as a `Deterministic` under its name and dims, so the posterior schema is unchanged. And it needs no initial value, so the ignored `set_initval` on a `Deterministic` that ADR-0016 worried about never arises. ADR-0016 accepted boundary divergences as the price of the Potential; under the default own-lag mean that price was most of the draws.

@@ -1146,7 +1146,7 @@ class VAR(ImpulsoBaseModel):
         `B[0, 0]` alone, and the region is `|B[0, 0]| < 1`. The own lag is
         registered as `latent_own_lag`, a `Normal` with its prior mean and
         standard deviation truncated to (-1, 1); every other coefficient is
-        in `B_free`, a flat `Normal` with the prior means and standard
+        in `B_free`, a one-dimensional `Normal` with the prior means and standard
         deviations of those entries; and `B` is a `Deterministic` assembled
         from the two, with the same name and dims as in every other case.
         PyMC samples the own lag through an interval transform, so the log
