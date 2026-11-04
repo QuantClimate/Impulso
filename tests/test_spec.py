@@ -340,6 +340,18 @@ class TestExogPriorScaleField:
         with pytest.raises(ValidationError):
             spec.exog_prior_scale = 5.0
 
+    @pytest.mark.parametrize("bad", [(1.0, 0.0), (1.0, -1.0), (1.0, np.inf), (np.nan,), np.inf])
+    def test_rejects_non_positive_or_non_finite_entries(self, bad):
+        with pytest.raises(ValidationError, match="exog_prior_scale must be positive and finite"):
+            VAR(lags=1, exog_prior_scale=bad)
+
+    def test_per_equation_scale_round_trips_through_json(self):
+        spec = VAR(lags=1, exog_prior_scale=(1.0, 100.0, 5.0))
+        restored = VAR.model_validate(spec.model_dump(mode="json"))
+        assert restored == spec
+        assert restored.exog_prior_scale == (1.0, 100.0, 5.0)
+        assert VAR.model_validate_json(spec.model_dump_json()) == spec
+
 
 class TestExogPriorSigma:
     """`_exog_prior_sigma` puts the B_exog prior in contribution space.
@@ -488,6 +500,16 @@ class TestExogPriorWiredIntoModel:
             _captured_sigma(model, "B_exog"),
             _exog_prior_sigma(ar1_residual_sd(endog), exog[1:], 5.0),
         )
+
+    def test_per_equation_knob_reaches_the_graph(self, rng):
+        endog = rng.standard_normal((150, 2))
+        exog = rng.standard_normal((150, 2)) * np.array([0.01, 250.0])
+        data = _exog_data(endog, exog, ["tiny", "huge"])
+
+        unit = _captured_sigma(self._capture(data, VAR(lags=1, exog_prior_scale=1.0)), "B_exog")
+        got = _captured_sigma(self._capture(data, VAR(lags=1, exog_prior_scale=(1.0, 100.0))), "B_exog")
+
+        np.testing.assert_allclose(got, np.array([[1.0], [100.0]]) * unit)
 
     def test_sigma_uses_lag_trimmed_rows(self, rng):
         """The prior keys off the rows the likelihood sees, not the raw column."""

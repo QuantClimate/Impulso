@@ -1,11 +1,12 @@
 """VAR model specification."""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Self, cast
 
 import numpy as np
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from impulso._arviz_compat import InferenceDataLike
 from impulso._base import ImpulsoBaseModel
@@ -428,6 +429,59 @@ def _latent_companion(B: Any, n_latent: int, n_vars: int, n_lags: int) -> "pt.Te
     return pt.concatenate([top, shift], axis=0)
 
 
+def _register_coefficients(
+    model: Any, b_mu: np.ndarray, b_sigma: np.ndarray, n_latent: int, n_lags: int
+) -> "pt.TensorVariable":
+    """Register `B`, the VAR lag coefficients with `dims=("var", "coeff")`, and keep its latent block stationary.
+
+    Without latent series `B` is one `Normal` with the prior's means and
+    standard deviations. With latent series an explosive latent block makes
+    the generated path explode and freezes the chain, so the block is
+    constrained to its stationary region, in one of two ways (ADR-0017):
+
+    - One latent series with `n_lags == 1`: the block is the own lag
+      `B[0, 0]` alone, and the region is `|B[0, 0]| < 1`. `B` is a
+      `Deterministic` scattered from a free block, `B_free`, a `Normal` over
+      every other entry with that entry's prior mean and standard deviation,
+      and a constrained block, `latent_own_lag`, the own lag's `Normal`
+      truncated to (-1, 1). PyMC samples the own lag through an interval
+      transform, which starts it at 0 and keeps it inside the region, so no
+      initial value is set.
+    - Otherwise: `B` is one `Normal`, started inside the region by
+      `_set_latent_b_initval` and kept there by the `latent_stationarity`
+      Potential.
+
+    Args:
+        model: The active `pymc.Model`.
+        b_mu: Prior means, shape `(n_vars, n_vars * n_lags)`.
+        b_sigma: Prior standard deviations, the same shape.
+        n_latent: Number of latent series (`0` for none).
+        n_lags: Lag order.
+
+    Returns:
+        `B`: the `Deterministic` for one latent series with `n_lags == 1`, the
+        `Normal` otherwise.
+    """
+    import pymc as pm
+    import pytensor.tensor as pt
+
+    if n_latent == 1 and n_lags == 1:
+        b_mu = np.asarray(b_mu, dtype=float)
+        b_sigma = np.asarray(b_sigma, dtype=float)
+        # Flat, row-major positions in `B`; position 0 is the latent own lag `B[0, 0]`.
+        constrained = np.array([0])
+        free = np.setdiff1d(np.arange(b_mu.size), constrained)
+        B_free = pm.Normal("B_free", mu=b_mu.ravel()[free], sigma=b_sigma.ravel()[free])
+        own_lag = pm.TruncatedNormal("latent_own_lag", mu=b_mu[0, 0], sigma=b_sigma[0, 0], lower=-1.0, upper=1.0)
+        flat = pt.zeros(b_mu.size)[free].set(B_free)[constrained].set(own_lag[None])
+        return pm.Deterministic(COEFFICIENTS, flat.reshape(b_mu.shape), dims=("var", "coeff"))
+    B = pm.Normal(COEFFICIENTS, mu=b_mu, sigma=b_sigma, dims=("var", "coeff"))
+    if n_latent:
+        _set_latent_b_initval(model, B, b_mu, n_latent)
+        _register_latent_stationarity(B, n_latent, np.shape(b_mu)[0], n_lags)
+    return B
+
+
 def _register_latent_stationarity(B: Any, n_latent: int, n_vars: int, n_lags: int) -> None:
     """Register the `latent_stationarity` Potential: 0 inside the stationary region, `-inf` outside.
 
@@ -684,7 +738,7 @@ def _register_likelihood(
 def _exog_prior_sigma(
     sigma: np.ndarray,
     x_exog: np.ndarray,
-    scale: float,
+    scale: float | Sequence[float],
     exog_names: Sequence[str] | None = None,
 ) -> np.ndarray:
     """Prior standard deviations for the exogenous coefficients `B_exog`.
@@ -696,15 +750,17 @@ def _exog_prior_sigma(
     on large-scale ones effectively unrestricted. This scales the prior so the
     belief lives in *contribution* space instead:
 
-        sd[i, j] = scale * sigma_i / s_j
+        sd[i, j] = scale_i * sigma_i / s_j
 
     where `sigma_i` is the AR(1) residual standard deviation of endogenous
     variable `i` (the same scale `MinnesotaPrior.build_priors` uses for its lag
     coefficients — see docs/adr/0015) and `s_j` is the sample standard
     deviation of exogenous column `j`. One prior standard deviation of
-    `B_exog[i, j]` then moves variable `i` by `scale` of its own residual
-    standard deviation when regressor `j` moves by one of its own. The default
-    `scale` is deliberately loose (see `VAR.exog_prior_scale`).
+    `B_exog[i, j]` then moves variable `i` by `scale_i` of its own residual
+    standard deviation when regressor `j` moves by one of its own. `scale_i`
+    is `scale` itself when `scale` is a scalar and its `i`-th entry when it is
+    a sequence. The default `scale` is deliberately loose (see
+    `VAR.exog_prior_scale`).
 
     Args:
         sigma: Per-endogenous-variable AR(1) residual standard deviation,
@@ -715,7 +771,9 @@ def _exog_prior_sigma(
         x_exog: Exogenous regressor block of shape `(T_eff, n_exog)`, already
             trimmed to the rows the likelihood sees.
         scale: Multiplier in units of "residual standard deviations of the
-            dependent variable per standard deviation of the regressor".
+            dependent variable per standard deviation of the regressor". A
+            scalar applies to every equation; a sequence gives one entry per
+            equation, in the order of `sigma`.
         exog_names: Optional column names, used only to make the
             constant-column error message readable.
 
@@ -723,6 +781,7 @@ def _exog_prior_sigma(
         Array of shape `(n_vars, n_exog)` of prior standard deviations.
 
     Raises:
+        ValueError: If `scale` is a sequence whose length is not `sigma`'s.
         ValueError: If a column of `x_exog` is exactly constant. `VARData`
             rejects columns that are constant over the whole sample, but
             trimming the first `n_lags` rows can flatten a column that did
@@ -731,6 +790,12 @@ def _exog_prior_sigma(
             intercept, so the coefficient is not identified; the floor below
             would happily hand it a wide prior and hide that.
     """
+    scale_arr = np.asarray(scale, dtype=float)
+    if scale_arr.ndim and scale_arr.shape != sigma.shape:
+        raise ValueError(
+            f"exog_prior_scale must be a scalar or have {sigma.size} entries to match n_vars, got {scale_arr.size}"
+        )
+
     s = x_exog.std(axis=0, ddof=1)
     # Checked before the floor is applied: the floor exists to tame columns with
     # tiny-but-real variation, not to manufacture a scale for columns with none.
@@ -745,7 +810,7 @@ def _exog_prior_sigma(
         )
     peak = np.abs(x_exog).max(axis=0)
     s_eff = np.maximum(s, _EXOG_SD_FLOOR_FRACTION * peak)
-    return scale * np.outer(sigma, 1.0 / s_eff)
+    return scale_arr.reshape(-1, 1) * np.outer(sigma, 1.0 / s_eff)
 
 
 @dataclass(frozen=True)
@@ -763,7 +828,10 @@ class VARModelHandles:
             covering only the included equations, when `build_in_model` was
             given a strict subset via `intercept_equations`; `None` when
             `intercept_equations` excluded every equation.
-        B: VAR lag coefficients, `dims=("var", "coeff")`.
+        B: VAR lag coefficients, `dims=("var", "coeff")`. A `Normal`, except
+            for one latent series with `n_lags=1`, where it is a
+            `Deterministic` assembled from `B_free` and `latent_own_lag` (see
+            "Latent stationarity" in `VAR.build_in_model`).
         B_exog: Exogenous coefficients, `dims=("var", "exog")`, or `None`
             when no exogenous block was registered.
         L: Lower-triangular Cholesky factor of the structural-shock scale
@@ -820,7 +888,15 @@ class VAR(ImpulsoBaseModel):
             engine uses `Vc = 10e6` on the intercept), and the prior's job here
             is to stop the scale of the regressor from silently setting the
             answer, not to shrink. Lower it to shrink `B_exog` towards zero.
-            Applies only to `VAR.fit`; `prior` governs the lag coefficients.
+            A scalar applies to every equation. A tuple gives one scale per
+            equation, in `endog_names` order, for a caller that needs one
+            equation tight (such as an embedded latent series, which has no
+            data to pull a loose prior back) and the rest loose; its length is
+            checked against the number of endogenous variables when the graph
+            is built. Every entry must be positive and finite. Governs the
+            exogenous block only; `prior` governs the lag coefficients.
+            `VAR.fit`, `VAR.prior_predictive` and `VAR.build_in_model` build
+            the same graph, so it applies to all three.
         error_dist: Observation error distribution — shorthand string
             (`"gaussian"`, the default, or `"student_t"`) or an
             `ErrorDistribution` protocol instance. The string form takes the
@@ -828,9 +904,6 @@ class VAR(ImpulsoBaseModel):
             degrees of freedom; pass `StudentT(nu=5.0)` to fix them. Heavy-
             tailed errors are rejected in combination with time-varying
             volatility.
-            Governs the exogenous block only; `prior` governs the lag
-            coefficients. Both `VAR.fit` and `VAR.prior_predictive` build the
-            same graph, so it applies to either.
     """
 
     lags: int | Literal["aic", "bic", "hq"] = Field(...)
@@ -844,8 +917,16 @@ class VAR(ImpulsoBaseModel):
     # (StochasticVolatility) itself has a discriminated field (dynamics/prior).
     prior: Literal["minnesota"] | MinnesotaPrior | Prior = "minnesota"
     volatility: Literal["constant", "sv"] | Constant | StochasticVolatility | PyMCVolatilityProcess = "constant"
-    exog_prior_scale: float = Field(100.0, gt=0)
+    exog_prior_scale: float | tuple[float, ...] = 100.0
     error_dist: Literal["gaussian", "student_t"] | Gaussian | StudentT | ErrorDistribution = "gaussian"
+
+    @field_validator("exog_prior_scale")
+    @classmethod
+    def _exog_prior_scale_is_positive(cls, value: float | tuple[float, ...]) -> float | tuple[float, ...]:
+        values = value if isinstance(value, tuple) else (value,)
+        if not all(math.isfinite(v) and v > 0 for v in values):
+            raise ValueError(f"exog_prior_scale must be positive and finite, got {value!r}")
+        return value
 
     @model_validator(mode="after")
     def _validate_spec(self) -> Self:
@@ -1052,38 +1133,61 @@ class VAR(ImpulsoBaseModel):
 
         Latent stationarity: an explosive draw of the latent
         equations' coefficients makes the generated path explode over the
-        sample and can freeze a chain. Three things guard against it. The
-        `pm.Potential` `"latent_stationarity"` is 0 when the spectral radius
-        of the companion matrix of the latent-on-latent block (the latent
-        rows' coefficients on latent lags, over all `n_lags`) is below 1 and
-        `-inf` otherwise. The observed series are data, not generated, so
-        this block alone decides whether the path explodes. `B` stays a single
-        `Normal`, so the posterior is its prior truncated to the stationary
-        region of the latent block; with a latent own-lag prior mean near 1
-        the posterior can press against that boundary and give divergences.
-        The prior sets that mean: `MinnesotaPrior(own_lag_mean=...)` takes
-        one entry per series, so a caller modelling a stationary deviation
-        passes 0 for the latent series and 1 for the random-walk observed
-        ones. And the model's initial point puts every latent equation
-        inside the stationary region: own first lag at its prior mean when
-        that is inside the region, otherwise 0.5, and every other
-        coefficient in the latent rows 0. PyMC's default start for a
-        `Normal` is its mean, so when every latent own-lag prior mean is
-        inside the region and the prior puts mean 0 on the rest of the
-        latent rows, as `MinnesotaPrior` does, no initial value is set.
-        Otherwise this method sets one for `B` as a whole, so the observed
-        rows start at their prior mean, which is PyMC's default start for
-        them anyway. PyMC cannot clone a model with a non-default initial
-        value: `model.copy()`, `pm.do` and `pm.observe` raise
-        `NotImplementedError`. A latent own-lag prior mean outside the
-        stationary region, the default of 1 included, therefore leaves the
-        host model unclonable.
-        PyMC's `jitter+adapt_diag` start moves this by up to +-1; a jittered
-        start outside the region has `-inf` log density, and PyMC redraws it
-        (`jitter_max_retries`). A Potential is not a random variable, so
-        `pm.sample_prior_predictive` ignores `"latent_stationarity"`:
-        prior-predictive latent paths are drawn from the untruncated prior
-        and can still explode.
+        sample and can freeze a chain. So the latent-on-latent block (the
+        latent rows' coefficients on latent lags, over all `n_lags`) is
+        constrained to its stationary region, where the spectral radius of
+        its companion matrix is below 1. The observed series are data, not
+        generated, so this block alone decides whether the path explodes.
+        Either way the posterior is the coefficients' prior truncated to that
+        region. How the constraint is enforced depends on the case
+        (ADR-0017).
+
+        One latent series with `n_lags=1`: the block is the latent own lag
+        `B[0, 0]` alone, and the region is `|B[0, 0]| < 1`. The own lag is
+        registered as `latent_own_lag`, a `Normal` with its prior mean and
+        standard deviation truncated to (-1, 1); every other coefficient is
+        in `B_free`, a one-dimensional `Normal` with the prior means and standard
+        deviations of those entries; and `B` is a `Deterministic` assembled
+        from the two, with the same name and dims as in every other case.
+        PyMC samples the own lag through an interval transform, so the log
+        density is smooth up to the boundary and NUTS has no wall to diverge
+        against, whatever the own-lag prior mean. The own lag starts at 0,
+        the interval's midpoint, and the free block at its prior mean, so no
+        initial value is set and the host model can always be cloned
+        (`model.copy()`, `pm.do`, `pm.observe`); PyMC's start jitter acts in
+        the transformed space and stays inside the region. Prior predictive
+        draws of the own lag come from the truncated prior, so
+        prior-predictive latent paths are stationary. There is no `eig` in
+        the graph, so the JAX backend can differentiate the model. The
+        truncation's normalising constant is part of the model's log
+        density.
+
+        Every other latent case (`n_lags > 1`, or several latent series):
+        `B` stays a single `Normal`, and the `pm.Potential`
+        `"latent_stationarity"` is 0 inside the region and `-inf` outside.
+        With a latent own-lag prior mean near 1 the posterior can press
+        against that boundary and give divergences. The prior sets that
+        mean: `MinnesotaPrior(own_lag_mean=...)` takes one entry per series,
+        so a caller modelling a stationary deviation passes 0 for the latent
+        series and 1 for the random-walk observed ones. The model's initial
+        point puts every latent equation inside the stationary region: own
+        first lag at its prior mean when that is inside the region,
+        otherwise 0.5, and every other coefficient in the latent rows 0.
+        PyMC's default start for a `Normal` is its mean, so when every
+        latent own-lag prior mean is inside the region and the prior puts
+        mean 0 on the rest of the latent rows, as `MinnesotaPrior` does, no
+        initial value is set. Otherwise this method sets one for `B` as a
+        whole, so the observed rows start at their prior mean, which is
+        PyMC's default start for them anyway. PyMC cannot clone a model with
+        a non-default initial value: `model.copy()`, `pm.do` and
+        `pm.observe` raise `NotImplementedError`. A latent own-lag prior mean
+        outside the stationary region, the default of 1 included, therefore
+        leaves the host model unclonable. PyMC's `jitter+adapt_diag` start
+        moves this by up to +-1; a jittered start outside the region has
+        `-inf` log density, and PyMC redraws it (`jitter_max_retries`). A
+        Potential is not a random variable, so `pm.sample_prior_predictive`
+        ignores `"latent_stationarity"`: prior-predictive latent paths are
+        drawn from the untruncated prior and can still explode.
 
         Nesting: open a `pm.Model(name=prefix)` before calling this method
         and every free random variable, `Deterministic` and the likelihood
@@ -1296,13 +1400,9 @@ class VAR(ImpulsoBaseModel):
         # equations; excluding every equation drops the term entirely.
         intercept, intercept_term = _register_intercept(intercept_mask)
 
-        # VAR coefficients with Minnesota prior
-        B = pm.Normal(
-            COEFFICIENTS,
-            mu=prior_params["B_mu"],
-            sigma=prior_params["B_sigma"],
-            dims=("var", "coeff"),
-        )
+        # VAR coefficients with Minnesota prior. With latent series this also keeps the latent block
+        # stationary (ADR-0016, ADR-0017).
+        B = _register_coefficients(model, prior_params["B_mu"], prior_params["B_sigma"], n_latent, n_lags)
 
         # Exogenous coefficients. The prior scales with the data so that it
         # encodes the same belief regardless of the units the regressors
@@ -1337,10 +1437,6 @@ class VAR(ImpulsoBaseModel):
         # non-centred, so the observed rows are conditioned on their innovations `z` (ADR-0016).
         latent = z = None
         if n_latent:
-            # Start the latent equations inside the stationary region: an explosive own-lag
-            # makes the generated path explode and freezes the chain.
-            _set_latent_b_initval(model, B, prior_params["B_mu"], n_latent)
-            _register_latent_stationarity(B, n_latent, n_vars, n_lags)
             latent, z = _latent_path(endog, X_exog, n_lags, n_vars, n_latent, intercept_term, B, B_exog, L, init_sigma)
             full = pt.concatenate([latent, pt.as_tensor_variable(endog)], axis=1)
             Y, X_lag, _ = build_lag_design_matrix(full, n_lags)
