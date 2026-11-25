@@ -1504,6 +1504,11 @@ class VAR(ImpulsoBaseModel):
         mcmc.run(jax.random.key(0), endog)
         ```
 
+        To compute impulse responses and forecasts from the samples, turn them
+        into a posterior with the block's `posterior_from_samples` and pass it
+        to `FittedVAR.from_posterior`; that method's docstring shows the whole
+        sequence.
+
         The block's site names are not prefixed. To embed two VARs in one
         NumPyro model, call each block inside its own
         `numpyro.handlers.scope(prefix=...)`.
@@ -1583,6 +1588,12 @@ class VAR(ImpulsoBaseModel):
         inputs = [*model.value_vars, endog]
         recorded = {INTERCEPT: handles.intercept, COEFFICIENTS: handles.B, "L": handles.L}
         site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
+        # PyMC's own dimension names, or its defaults for a variable it gives none (`L`).
+        dimension_names = {
+            name: tuple(model.named_vars_to_dims.get(name) or (f"{name}_dim_{i}" for i in range(variable.ndim)))
+            for name, variable in recorded.items()
+        }
+        labelled = {dim for dims in dimension_names.values() for dim in dims if model.coords.get(dim) is not None}
         return CompiledNumPyroBlock(
             numpyro_site_names=site_names,
             # PyMC gives some value variables no static shape (`B`'s among
@@ -1597,6 +1608,8 @@ class VAR(ImpulsoBaseModel):
             recorded_quantities=get_jaxified_graph(
                 inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
             ),
+            dimension_names=dimension_names,
+            coordinate_labels={dim: tuple(model.coords[dim]) for dim in labelled},
         )
 
     def _build_pymc_model(self, data: VARData) -> tuple[Any, int]:
