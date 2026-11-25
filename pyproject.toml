@@ -58,6 +58,7 @@ Documentation = "https://impulso.quantclimate.com/"
 
 [project.optional-dependencies]
 nutpie = ["nutpie>=0.13"]
+numpyro = ["jax>=0.7.0", "numpyro>=0.20"]
 diagnostics = ["statsmodels>=0.14.6"]
 
 [dependency-groups]
@@ -71,6 +72,8 @@ dev = [
     "jupyter>=1.0",
     "ipywidgets>=8.1.8",
     "nutpie>=0.13",
+    "jax>=0.7.0",
+    "numpyro>=0.20",
     "statsmodels>=0.14.6",
     "tabulate>=0.10.0",
     "typing-extensions>=4.12",

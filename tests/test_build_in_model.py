@@ -1819,6 +1819,20 @@ def _latent_setup_n(rng: np.random.Generator, n_latent: int, n_lags: int) -> dic
     }
 
 
+def _skip_without_jax_scan_gradients() -> None:
+    """Skip unless JAX is installed and PyTensor can convert the gradient of a `scan` to JAX.
+
+    The latent path is a `scan`, and PyTensor added JAX support for `scan` gradients in 2.36. PyMC 5.26.1, the
+    oldest PyMC 5 that Impulso allows, caps PyTensor below 2.36.
+    """
+    pytest.importorskip("jax")
+    import pytensor
+    from packaging.version import Version
+
+    if Version(pytensor.__version__) < Version("2.36"):
+        pytest.skip("PyTensor < 2.36 cannot convert the gradient of a scan to JAX")
+
+
 def _numpy_companion(B: np.ndarray, n_latent: int, n_vars: int, n_lags: int) -> np.ndarray:
     """Reference companion matrix of the latent-on-latent block of lag-major `B`."""
     size = n_latent * n_lags
@@ -1919,10 +1933,19 @@ class TestLatentStationarity:
             pytest.skip("PyTensor < 2.37 raises ValueError from SolveTriangular before compile_logp() runs")
         assert not np.isfinite(model.compile_logp()({**point, "B": B}))
 
+    @pytest.mark.xfail(
+        strict=True,
+        raises=TypeError,
+        reason=(
+            "Issue #404: with `n_lags >= 2` the gradient reshapes to a size that PyTensor computes at run time from "
+            "the shape of `B`, and JAX cannot trace that. The log-probability compiles: see "
+            "`test_logp_compiles_under_jax`."
+        ),
+    )
     def test_logp_and_dlogp_compile_under_jax(self, rng):
         """The latent model, `eig` and the zero-gradient `OpFromGraph` included,
         compiles under the JAX backend."""
-        pytest.importorskip("jax")
+        _skip_without_jax_scan_gradients()
         import pymc as pm
 
         with pm.Model() as model:
@@ -1931,6 +1954,16 @@ class TestLatentStationarity:
         point = model.initial_point(random_seed=0)
         assert np.isfinite(model.compile_logp(mode="JAX")(point))
         assert np.all(np.isfinite(model.compile_dlogp(mode="JAX")(point)))
+
+    def test_logp_compiles_under_jax(self, rng):
+        """The log-probability alone compiles under the JAX backend, though its gradient does not (issue #404)."""
+        pytest.importorskip("jax")
+        import pymc as pm
+
+        with pm.Model() as model:
+            VAR(lags=2).build_in_model(**_latent_setup_n(rng, 2, 2))
+
+        assert np.isfinite(model.compile_logp(mode="JAX")(model.initial_point(random_seed=0)))
 
 
 def _one_latent_lag_one_model(rng: np.random.Generator, prior="minnesota"):
@@ -2028,7 +2061,7 @@ class TestTruncatedOwnLag:
         assert own_lags.mean() < 0.95
 
     def test_logp_and_dlogp_compile_under_jax(self, rng):
-        pytest.importorskip("jax")
+        _skip_without_jax_scan_gradients()
         model, _ = _one_latent_lag_one_model(rng)
 
         point = _point_with_own_lag(model, 0.9)
