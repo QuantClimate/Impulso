@@ -48,6 +48,7 @@ _.rank
 
 # impulso.spec.VAR
 _.prior_predictive
+_.compile_for_numpyro
 
 # impulso.sv.fitted.FittedSV
 _.log_volatility

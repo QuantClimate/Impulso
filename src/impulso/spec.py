@@ -11,6 +11,7 @@ from pydantic import Field, field_validator, model_validator
 from impulso._arviz_compat import InferenceDataLike
 from impulso._base import ImpulsoBaseModel
 from impulso._design import build_lag_design_matrix
+from impulso._optional import require_all
 from impulso._posterior import COEFFICIENTS, EXOG_COEFFICIENTS, INTERCEPT
 from impulso.data import VARData, _format_names
 from impulso.observation import Gaussian, StudentT
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     import pytensor.tensor as pt
 
     from impulso.fitted import FittedVAR
+    from impulso.numpyro_block import CompiledNumPyroBlock
 
 _PRIOR_REGISTRY: dict[str, type] = {
     "minnesota": MinnesotaPrior,
@@ -1448,6 +1450,153 @@ class VAR(ImpulsoBaseModel):
 
         return VARModelHandles(
             intercept=intercept, B=B, B_exog=B_exog, L=L, obs=obs, latent=latent, latent_names=latent_names
+        )
+
+    def compile_for_numpyro(
+        self,
+        exog: np.ndarray | None,
+        n_lags: int,
+        endog_names: Sequence[str],
+        exog_names: Sequence[str] | None = None,
+        endog_scales: np.ndarray | Sequence[float] | None = None,
+        intercept_equations: Sequence[str] | None = None,
+    ) -> "CompiledNumPyroBlock":
+        """Compile this VAR once, for use inside a NumPyro model.
+
+        The VAR is still defined only in PyMC. This method opens a fresh
+        `pymc.Model`, calls `build_in_model` with a symbolic placeholder for
+        `endog`, and compiles two JAX functions from that model with PyMC's
+        JAX compilation, the one `pymc.sample(nuts_sampler="numpyro")` uses:
+        the joint log-density, as a function of the VAR's parameter values
+        and `endog`; and the map from the same inputs to `B`, `intercept` and
+        `L`. It returns them as a `CompiledNumPyroBlock`. The PyMC model is
+        built and compiled here, once, and never inside the NumPyro model
+        function, however often NumPyro traces it.
+
+        Call the returned block inside a NumPyro model function, passing
+        `endog`: observed data, or an array the NumPyro model generated. Each
+        call:
+
+        - declares one real-valued NumPyro sample site per free PyMC
+          variable. The site holds the variable on PyMC's unconstrained scale
+          (for example the log of a standard deviation) and has no NumPyro
+          prior of its own: its distribution is NumPyro's `ImproperUniform`
+          on the real line. The block's `numpyro_site_names` maps each PyMC
+          value-variable name to its site's name;
+        - adds the compiled log-density, priors and likelihood together, to
+          the NumPyro model with `numpyro.factor`. It keeps PyMC's transform
+          correction terms, so NumPyro's log-density of the model equals
+          PyMC's log-density at the same parameter values;
+        - records `B`, `intercept` and `L` with `numpyro.deterministic`,
+          under their unprefixed posterior-schema names;
+        - returns them as a `VARModelValues`.
+
+        ```python
+        block = VAR(lags=2).compile_for_numpyro(
+            exog=None, n_lags=2, endog_names=["gdp", "inflation"], endog_scales=impulso.ar1_residual_sd(endog)
+        )
+
+        def model(endog):
+            values = block(endog)  # values.B, values.intercept, values.L
+            ...
+
+        mcmc = numpyro.infer.MCMC(numpyro.infer.NUTS(model), num_warmup=500, num_samples=500)
+        mcmc.run(jax.random.key(0), endog)
+        ```
+
+        The block's site names are not prefixed. To embed two VARs in one
+        NumPyro model, call each block inside its own
+        `numpyro.handlers.scope(prefix=...)`.
+
+        Limitations:
+
+        - NumPyro cannot draw the VAR's parameters, because their sites have
+          no NumPyro distribution to draw from. Prior predictive sampling of
+          the VAR inside NumPyro (`numpyro.infer.Predictive` without
+          posterior samples) does not work.
+        - `numpyro.handlers.do` on the VAR's parameters does not work. `do`
+          ignores deterministic sites such as `B`, `intercept` and `L`. On an
+          unconstrained site it draws the original value, which has no
+          distribution to draw from, and it cannot remove that parameter's
+          prior, which is part of the compiled log-density.
+        - `exog` is fixed at compile time, because the exogenous prior scales
+          with each regressor's sample standard deviation (ADR-0012). A call
+          takes only `endog`.
+        - The embedded-path refusals of `build_in_model` apply, because
+          `endog` is symbolic at compile time: `self.lags` must be an integer,
+          not a selection criterion string; `self.volatility` must be
+          constant volatility; and `endog_scales` is required. This method
+          raises them, with `build_in_model`'s messages, before compiling
+          anything.
+
+        Importing PyTensor's JAX backend switches JAX to 64-bit floats
+        (`jax_enable_x64`) when PyTensor's `floatX` is `float64`, its default.
+
+        Args:
+            exog: Exogenous regressors, shape `(T, n_exog)`, or `None`. Fixed
+                at compile time (see Limitations).
+            n_lags: Lag order, a concrete integer.
+            endog_names: Names of the endogenous variables, length `n_vars`,
+                in the column order of the `endog` each call receives.
+            exog_names: Names of the exogenous columns. Required when `exog`
+                is given.
+            endog_scales: Per-variable scale, shape `(n_vars,)`, shared by the
+                Minnesota cross-lag prior and the exogenous prior. Required.
+            intercept_equations: Names of the equations that get an
+                intercept, as in `build_in_model`. `None` (the default) means
+                every equation.
+
+        Returns:
+            The compiled NumPyro block.
+
+        Raises:
+            ImportError: If JAX or NumPyro is not installed. The message
+                names the missing packages.
+            ValueError: `build_in_model`'s refusals for a symbolic `endog`
+                (see Limitations), and its other argument checks.
+        """
+        require_all("jax", "numpyro", extra="numpyro")
+
+        import pymc as pm
+        import pytensor
+        import pytensor.tensor as pt
+        from pymc.sampling.jax import get_jaxified_graph
+
+        from impulso.numpyro_block import UNCONSTRAINED_SITE_PREFIX, CompiledNumPyroBlock
+
+        # The row count is left unknown so one block accepts an `endog` of any
+        # length; JAX fixes it when it traces a call. The column count is
+        # static so `build_in_model` checks it against `endog_names`. An
+        # unnamed model keeps every name unprefixed.
+        endog = pt.tensor("endog", shape=(None, len(endog_names)), dtype=pytensor.config.floatX)
+        with pm.Model() as model:
+            handles = self.build_in_model(
+                endog=endog,
+                exog=exog,
+                n_lags=n_lags,
+                endog_names=endog_names,
+                exog_names=exog_names,
+                endog_scales=endog_scales,
+                intercept_equations=intercept_equations,
+            )
+
+        inputs = [*model.value_vars, endog]
+        recorded = {INTERCEPT: handles.intercept, COEFFICIENTS: handles.B, "L": handles.L}
+        site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
+        return CompiledNumPyroBlock(
+            numpyro_site_names=site_names,
+            # PyMC gives some value variables no static shape (`B`'s among
+            # them), so the shapes come from evaluating the initial point.
+            site_shapes={site_names[name]: np.shape(value) for name, value in model.initial_point().items()},
+            recorded_names=tuple(recorded),
+            # `model.logp()` sums the priors, the Potentials (the likelihood
+            # `obs` among them) and the transforms' correction terms.
+            log_density=get_jaxified_graph(inputs=inputs, outputs=[model.logp()]),
+            # Rewritten in terms of the value variables, undoing their
+            # transforms, so the function reads its inputs instead of drawing.
+            recorded_quantities=get_jaxified_graph(
+                inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
+            ),
         )
 
     def _build_pymc_model(self, data: VARData) -> tuple[Any, int]:
