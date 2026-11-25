@@ -4,9 +4,9 @@ The compile step builds the VAR's PyMC model once, with `VAR.build_in_model`,
 and returns a compiled NumPyro block that a user calls inside their own NumPyro
 model. Every test goes through that public seam: it compiles a `VAR`, calls the
 block inside a NumPyro model function, and compares what a NumPyro user sees
-(NumPyro's own log-density, its gradient, the recorded `B`, `intercept`, `L` and
-`latent`, the initial point) with the same VAR built in PyMC by `build_in_model`
-with a symbolic `endog`.
+(NumPyro's own log-density, its gradient, the recorded quantities, the initial
+point) with the same VAR built in PyMC by `build_in_model` with a symbolic
+`endog`.
 
 The tests that need JAX and NumPyro skip without them. The missing-package
 tests do not: they hide the packages themselves.
@@ -14,22 +14,67 @@ tests do not: they hide the packages themselves.
 
 import subprocess
 import sys
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
 
 from impulso import VAR, ar1_residual_sd
+from impulso.observation import StudentT
 
 ENDOG_NAMES = ["y1", "y2"]
+EXOG_NAMES = ["x1", "x2"]
 N_ROWS = 40
-RECORDED_NAMES = ["B", "intercept", "L"]
+RECORDED_NAMES = ["B", "intercept", "B_exog", "L", "nu", "latent"]
+"""Every quantity a call can record, under its posterior-schema name. Which ones a model has depends on the
+variant: `intercept` is absent without an intercept, `B_exog` without exogenous regressors, `nu` under
+Gaussian errors, `latent` without latent series."""
+
+
+@dataclass(frozen=True)
+class ModelVariant:
+    """An embedded-path model variant: the VAR specification and the `build_in_model` options it is built with."""
+
+    n_lags: int = 1
+    error_dist: str | StudentT = "gaussian"
+    exogenous_regressors: bool = False
+    intercept_equations: tuple[str, ...] | None = None
+    n_latent: int = 0
+    """Number of latent series, `b0, b1, ...`, ahead of the two observed series."""
+
+    @property
+    def spec(self) -> VAR:
+        return VAR(lags=self.n_lags, error_dist=self.error_dist)
+
+    def build_kwargs(self, endog: np.ndarray) -> dict:
+        """`build_in_model`'s arguments other than `endog`. The exogenous regressors have standard deviations
+        0.5 and 3, so the exogenous prior's scaling by each regressor's standard deviation (ADR-0012) matters."""
+        kwargs = _build_kwargs(endog, self.n_lags, self.n_latent)
+        if self.exogenous_regressors:
+            exog_rng = np.random.default_rng(7)
+            kwargs["exog"] = exog_rng.standard_normal((endog.shape[0], len(EXOG_NAMES))) * np.array([0.5, 3.0])
+            kwargs["exog_names"] = EXOG_NAMES
+        if self.intercept_equations is not None:
+            kwargs["intercept_equations"] = list(self.intercept_equations)
+        return kwargs
+
+
 MODEL_VARIANTS = [
-    pytest.param(0, 1, id="observed series, 1 lag"),
-    pytest.param(0, 2, id="observed series, 2 lags"),
-    pytest.param(1, 1, id="1 latent series, 1 lag (truncated own lag)"),
-    pytest.param(2, 2, id="2 latent series, 2 lags (stationarity Potential)"),
+    pytest.param(ModelVariant(n_lags=1), id="gaussian, 1 lag"),
+    pytest.param(ModelVariant(n_lags=2), id="gaussian, 2 lags"),
+    pytest.param(ModelVariant(exogenous_regressors=True), id="exogenous regressors"),
+    pytest.param(ModelVariant(intercept_equations=("y2",)), id="intercept on a strict subset of equations"),
+    pytest.param(ModelVariant(intercept_equations=()), id="no intercept"),
+    pytest.param(ModelVariant(error_dist="student_t"), id="student-t"),
+    pytest.param(ModelVariant(error_dist=StudentT(nu=6.0)), id="student-t, fixed degrees of freedom"),
+    pytest.param(
+        ModelVariant(n_lags=2, error_dist="student_t", exogenous_regressors=True),
+        id="student-t, exogenous regressors",
+    ),
+    pytest.param(ModelVariant(n_latent=1), id="1 latent series, 1 lag (truncated own lag)"),
+    pytest.param(ModelVariant(n_lags=2, n_latent=2), id="2 latent series, 2 lags (stationarity Potential)"),
 ]
-"""Model variants as `(n_latent, n_lags)`: the number of latent series and the lag order."""
+"""The embedded-path model variants every parity test runs on. A new variant needs only a case here."""
 
 
 def _require_numpyro():
@@ -120,14 +165,14 @@ def _count_function_graphs(monkeypatch) -> list[int]:
 class TestLogDensityParity:
     """NumPyro's log-density of a model calling the block equals PyMC's log-density of the same VAR."""
 
-    @pytest.mark.parametrize(("n_latent", "n_lags"), MODEL_VARIANTS)
-    def test_observed_endog(self, rng, n_latent, n_lags):
+    @pytest.mark.parametrize("variant", MODEL_VARIANTS)
+    def test_observed_endog(self, rng, variant):
         _require_numpyro()
         from numpyro.infer.util import log_density
 
         endog = rng.standard_normal((N_ROWS, 2))
-        kwargs = _build_kwargs(endog, n_lags, n_latent)
-        spec = VAR(lags=n_lags)
+        kwargs = variant.build_kwargs(endog)
+        spec = variant.spec
         model = _pymc_model(spec, endog, kwargs)
         point = _pymc_point(model, rng)
         pymc_log_density = float(model.compile_logp()(point))
@@ -186,39 +231,70 @@ def test_log_density_is_minus_infinity_outside_the_latent_stationary_region(rng)
     assert float(numpyro_log_density) == -np.inf
 
 
-@pytest.mark.parametrize(("n_latent", "n_lags"), MODEL_VARIANTS)
-def test_recorded_and_returned_quantities_equal_pymc_values(rng, n_latent, n_lags):
-    """A call records `B`, `intercept`, `L` and, with latent series, the generated `latent` paths as deterministic
-    sites under their posterior-schema names, and returns them, with PyMC's values at the same parameter point. It
-    also returns the latent series' names in the path's column order, as `build_in_model`'s handles do."""
+@pytest.mark.parametrize("variant", MODEL_VARIANTS)
+def test_recorded_and_returned_quantities_equal_pymc_values(rng, variant):
+    """A call records `B`, `intercept`, `B_exog`, `L`, `nu` and `latent` as deterministic sites under their
+    posterior-schema names, and returns them, with PyMC's values at the same parameter point. A quantity the
+    PyMC model does not have is neither recorded nor returned: the call returns `None` in its place. The call
+    also returns the latent series' names in the column order of `latent`, as `build_in_model`'s handles do."""
     _require_numpyro()
     from numpyro import handlers
 
     endog = rng.standard_normal((N_ROWS, 2))
-    kwargs = _build_kwargs(endog, n_lags, n_latent)
-    spec = VAR(lags=n_lags)
+    kwargs = variant.build_kwargs(endog)
+    spec = variant.spec
     model = _pymc_model(spec, endog, kwargs)
     point = _pymc_point(model, rng)
-    recorded_names = [*RECORDED_NAMES, "latent"] if n_latent else RECORDED_NAMES
-    expected = _pymc_values(model, point, recorded_names)
+    present = [name for name in RECORDED_NAMES if name in model.named_vars]
+    expected = _pymc_values(model, point, present)
 
     block = _compile(spec, endog, kwargs)
     substituted = handlers.substitute(_observed_endog_model(block), data=_numpyro_params(block, point))
     trace = handlers.trace(substituted).get_trace(endog)
     returned = substituted(endog)
 
-    for name in recorded_names:
+    for name in present:
         assert trace[name]["type"] == "deterministic"
         np.testing.assert_allclose(trace[name]["value"], expected[name], rtol=1e-10)
         np.testing.assert_allclose(getattr(returned, name), expected[name], rtol=1e-10)
-    assert returned.latent_names == tuple(f"b{i}" for i in range(n_latent))
-    if not n_latent:
-        assert returned.latent is None
-        assert "latent" not in trace
+    for name in set(RECORDED_NAMES) - set(present):
+        assert name not in trace
+        assert getattr(returned, name) is None
+    assert returned.latent_names == tuple(f"b{i}" for i in range(variant.n_latent))
 
 
-@pytest.mark.parametrize(("n_latent", "n_lags"), MODEL_VARIANTS)
-def test_log_density_gradient_is_finite_and_equals_pymc_at_the_pymc_initial_point(rng, n_latent, n_lags):
+@pytest.mark.parametrize(
+    ("variant", "expected_present"),
+    [
+        (ModelVariant(), {"intercept"}),
+        (ModelVariant(exogenous_regressors=True), {"intercept", "B_exog"}),
+        (ModelVariant(intercept_equations=()), set()),
+        (ModelVariant(error_dist="student_t"), {"intercept", "nu"}),
+        (ModelVariant(n_latent=1), {"intercept", "latent"}),
+    ],
+    ids=["gaussian", "exogenous regressors", "no intercept", "student-t", "latent series"],
+)
+def test_which_optional_quantities_are_recorded(rng, variant, expected_present):
+    """`B` and `L` are always recorded. `intercept` is recorded unless every equation is excluded, `B_exog`
+    only with exogenous regressors, `nu` only under Student-t errors, and `latent` only with latent series. Pins
+    the variants of the comparison with PyMC above, which reads the names from the PyMC model, so a PyMC model
+    that lost a quantity would otherwise pass it unnoticed."""
+    _require_numpyro()
+    from numpyro import handlers
+
+    endog = rng.standard_normal((N_ROWS, 2))
+    kwargs = variant.build_kwargs(endog)
+    initial_point = _pymc_model(variant.spec, endog, kwargs).initial_point()
+    block = _compile(variant.spec, endog, kwargs)
+    params = _numpyro_params(block, initial_point)
+    trace = handlers.trace(handlers.substitute(_observed_endog_model(block), data=params)).get_trace(endog)
+
+    recorded = {name for name, site in trace.items() if site["type"] == "deterministic"}
+    assert recorded == {"B", "L"} | expected_present
+
+
+@pytest.mark.parametrize("variant", MODEL_VARIANTS)
+def test_log_density_gradient_is_finite_and_equals_pymc_at_the_pymc_initial_point(rng, variant):
     """With latent series and two lags the log-density holds the `latent_stationarity` Potential, whose
     eigendecomposition JAX cannot differentiate. The gradient is still finite, and it equals PyMC's, which passes
     that Potential no gradient."""
@@ -227,8 +303,8 @@ def test_log_density_gradient_is_finite_and_equals_pymc_at_the_pymc_initial_poin
     from numpyro.infer.util import log_density
 
     endog = rng.standard_normal((N_ROWS, 2))
-    kwargs = _build_kwargs(endog, n_lags, n_latent)
-    spec = VAR(lags=n_lags)
+    kwargs = variant.build_kwargs(endog)
+    spec = variant.spec
     model = _pymc_model(spec, endog, kwargs)
     initial_point = model.initial_point()
     block = _compile(spec, endog, kwargs)
@@ -246,8 +322,8 @@ def test_log_density_gradient_is_finite_and_equals_pymc_at_the_pymc_initial_poin
     np.testing.assert_allclose(np.concatenate(numpyro_gradient), pymc_gradient, rtol=1e-9, atol=1e-9)
 
 
-@pytest.mark.parametrize(("n_latent", "n_lags"), MODEL_VARIANTS)
-def test_initial_point_starts_numpyro_at_the_pymc_initial_point(rng, n_latent, n_lags):
+@pytest.mark.parametrize("variant", MODEL_VARIANTS)
+def test_initial_point_starts_numpyro_at_the_pymc_initial_point(rng, variant):
     """`init_to_value` with the block's initial point starts NumPyro at PyMC's initial point, where the log-density
     and its gradient are finite. Every variant uses the default latent own-lag prior mean of 1, outside the latent
     block's stationary region, so with two lags PyMC starts the latent own lags at 0.5 instead (ADR-0016)."""
@@ -257,10 +333,9 @@ def test_initial_point_starts_numpyro_at_the_pymc_initial_point(rng, n_latent, n
     from numpyro.infer.util import initialize_model
 
     endog = rng.standard_normal((N_ROWS, 2))
-    kwargs = _build_kwargs(endog, n_lags, n_latent)
-    spec = VAR(lags=n_lags)
-    block = _compile(spec, endog, kwargs)
-    expected = _numpyro_params(block, _pymc_model(spec, endog, kwargs).initial_point())
+    kwargs = variant.build_kwargs(endog)
+    block = _compile(variant.spec, endog, kwargs)
+    expected = _numpyro_params(block, _pymc_model(variant.spec, endog, kwargs).initial_point())
 
     started = initialize_model(
         jax.random.key(0),

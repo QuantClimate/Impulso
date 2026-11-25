@@ -37,6 +37,9 @@ _.historical_decomposition
 _.counterfactual
 _.structural_scenario
 
+# impulso.numpyro_block.CompiledNumPyroBlock
+_.posterior_from_samples
+
 # impulso.results
 _.difference
 _.summary

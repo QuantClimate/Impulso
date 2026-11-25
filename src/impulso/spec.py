@@ -1478,10 +1478,10 @@ class VAR(ImpulsoBaseModel):
         JAX compilation, the one `pymc.sample(nuts_sampler="numpyro")` uses:
         the joint log-density, as a function of the VAR's parameter values
         and `endog`; and the map from the same inputs to `B`, `intercept`,
-        `L` and, with latent series, the generated `latent` paths. It returns
-        them as a `CompiledNumPyroBlock`. The PyMC model is built and
-        compiled here, once, and never inside the NumPyro model function,
-        however often NumPyro traces it.
+        `B_exog`, `L`, under Student-t errors `nu`, and with latent series the
+        generated `latent` paths. It returns them as a `CompiledNumPyroBlock`.
+        The PyMC model is built and compiled here, once, and never inside the
+        NumPyro model function, however often NumPyro traces it.
 
         Call the returned block inside a NumPyro model function, passing
         `endog`: observed data, or an array the NumPyro model generated. Each
@@ -1497,10 +1497,18 @@ class VAR(ImpulsoBaseModel):
           the NumPyro model with `numpyro.factor`. It keeps PyMC's transform
           correction terms, so NumPyro's log-density of the model equals
           PyMC's log-density at the same parameter values;
-        - records `B`, `intercept`, `L` and, with latent series, `latent`
-          with `numpyro.deterministic`, under their unprefixed
-          posterior-schema names;
-        - returns them as a `VARModelValues`, together with the latent
+        - records `B`, `intercept`, `B_exog`, `L`, `nu` and `latent` with
+          `numpyro.deterministic`, under their unprefixed posterior-schema
+          names. A quantity the VAR does not have is not recorded: `intercept`
+          when `intercept_equations` is empty, `B_exog` when `exog` is `None`,
+          `nu` under Gaussian errors, and `latent` without latent series.
+          Under Student-t errors `nu` is recorded whether the degrees of
+          freedom are inferred or fixed, and `L` factors the scale matrix, not
+          the covariance (ADR-0007). With a strict-subset
+          `intercept_equations`, `intercept` covers only the included
+          equations, as PyMC's does;
+        - returns them as a `VARModelValues`, with `None` for each quantity
+          not recorded, as `VARModelHandles` has, together with the latent
           series' names in the column order of `latent`.
 
         ```python
@@ -1516,9 +1524,15 @@ class VAR(ImpulsoBaseModel):
         mcmc.run(jax.random.key(0), endog)
         ```
 
+        To compute impulse responses and forecasts from the samples, turn them
+        into a posterior with the block's `posterior_from_samples` and pass it
+        to `FittedVAR.from_posterior`. The docstring of
+        `CompiledNumPyroBlock.posterior_from_samples` shows the whole sequence.
+
         The block's site names are not prefixed. To embed two VARs in one
         NumPyro model, call each block inside its own
-        `numpyro.handlers.scope(prefix=...)`.
+        `numpyro.handlers.scope(prefix=...)`. The recorded names then carry
+        the prefix, and `posterior_from_samples` needs them without it.
 
         Latent series: `latent_names` and `latent_init_sigma` declare latent
         endogenous series as in `build_in_model`: they come first in
@@ -1595,7 +1609,7 @@ class VAR(ImpulsoBaseModel):
                 Minnesota cross-lag prior and the exogenous prior. Required.
             intercept_equations: Names of the equations that get an
                 intercept, as in `build_in_model`. `None` (the default) means
-                every equation.
+                every equation; an empty sequence means none.
             latent_names: Names of the latent endogenous series, the first
                 entries of `endog_names`, as in `build_in_model`. Empty (the
                 default) means no latent series.
@@ -1667,13 +1681,34 @@ class VAR(ImpulsoBaseModel):
             log_density = add_with_zero_gradient(
                 log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=stationarity)])
             )
-        recorded = {INTERCEPT: handles.intercept, COEFFICIENTS: handles.B, "L": handles.L}
-        if handles.latent is not None:
-            recorded["latent"] = handles.latent
+        # The posterior schema reads `nu` exactly when the error distribution
+        # is heavy-tailed. The Student-t adapter registers it as the
+        # Deterministic "nu" whether the degrees of freedom are inferred or
+        # fixed.
+        degrees_of_freedom = model["nu"] if self.resolved_error_dist.is_heavy_tailed else None
+        quantities = {
+            INTERCEPT: handles.intercept,
+            COEFFICIENTS: handles.B,
+            EXOG_COEFFICIENTS: handles.B_exog,
+            "L": handles.L,
+            "nu": degrees_of_freedom,
+            "latent": handles.latent,
+        }
+        # A quantity the model does not have (no intercept, no exogenous
+        # regressors, Gaussian errors, no latent series) is not recorded,
+        # and the call returns `None` for it.
+        recorded = {name: quantity for name, quantity in quantities.items() if quantity is not None}
         site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
         # On the unconstrained scale, keyed by value-variable name. It holds
         # the stationary start `B` gets with latent series (ADR-0016).
         initial_point = model.initial_point()
+        # PyMC's own dimension names, or its defaults for a variable it gives
+        # none: `L_dim_0` and `L_dim_1` for `L`, and none for the scalar `nu`.
+        dimension_names = {
+            name: tuple(model.named_vars_to_dims.get(name) or (f"{name}_dim_{i}" for i in range(variable.ndim)))
+            for name, variable in recorded.items()
+        }
+        labelled = {dim for dims in dimension_names.values() for dim in dims if model.coords.get(dim) is not None}
         return CompiledNumPyroBlock(
             numpyro_site_names=site_names,
             # PyMC gives some value variables no static shape (`B`'s among
@@ -1686,6 +1721,8 @@ class VAR(ImpulsoBaseModel):
             recorded_quantities=get_jaxified_graph(
                 inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
             ),
+            dimension_names=dimension_names,
+            coordinate_labels={dim: tuple(model.coords[dim]) for dim in labelled},
             initial_point={site_names[name]: value for name, value in initial_point.items()},
             latent_names=handles.latent_names,
             n_endog_rows=n_endog_rows,
