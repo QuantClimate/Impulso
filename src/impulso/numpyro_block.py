@@ -21,25 +21,37 @@ LOG_DENSITY_SITE = "VAR_log_density"
 """Name of the `numpyro.factor` site that adds the VAR's joint log-density."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class VARModelValues:
     """Values, as JAX arrays, of the VAR quantities a `CompiledNumPyroBlock` call records.
 
     The NumPyro counterpart of `VARModelHandles`: where those are PyMC
     variables, these are the values the block computed from the NumPyro
-    model's current parameter values.
+    model's current parameter values. A quantity the VAR does not have is
+    `None` and is not recorded.
 
     Attributes:
-        intercept: Per-equation intercept, shape `(n_vars,)`.
+        intercept: Per-equation intercept. Shape `(n_vars,)` when every
+            equation has one (the default); shape `(n_included,)`, covering
+            only the included equations in `endog_names` order, when
+            `intercept_equations` named a strict subset; `None` when
+            `intercept_equations` excluded every equation.
         B: VAR lag coefficients, shape `(n_vars, n_vars * n_lags)`, lag-major
             columns.
+        B_exog: Exogenous coefficients, shape `(n_vars, n_exog)`; `None`
+            without exogenous regressors.
         L: Lower-triangular Cholesky factor of the structural-shock scale
-            matrix, shape `(n_vars, n_vars)`.
+            matrix, shape `(n_vars, n_vars)`. Under Student-t errors this is
+            the factor of the scale matrix, not of the covariance (ADR-0007).
+        nu: Degrees of freedom of the Student-t errors, a scalar, whether
+            inferred or fixed; `None` under Gaussian errors.
     """
 
-    intercept: Any
+    intercept: Any = None
     B: Any
+    B_exog: Any = None
     L: Any
+    nu: Any = None
 
 
 @dataclass(frozen=True)
