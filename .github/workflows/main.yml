@@ -64,9 +64,9 @@ jobs:
           "
 
       - name: Import JAX and NumPyro
-        # The JAX tests skip when `import jax` fails, so a missing or broken
-        # JAX would turn them into silent skips. Failing here instead keeps
-        # them running.
+        # The JAX tests of tests/test_build_in_model.py skip when `import jax`
+        # fails, so a missing or broken JAX would skip them without failing
+        # the job. This step fails the job instead.
         run: |
           uv run --no-sync python -c "
           import jax, numpyro
@@ -222,8 +222,8 @@ jobs:
           .venv-wheel/bin/python -c "
           import importlib.metadata as m
           import importlib.util
-          for optional in ['jax', 'numpyro']:
-              assert importlib.util.find_spec(optional) is None, f'{optional} must not be a required dependency'
+          for package in ['jax', 'numpyro']:
+              assert importlib.util.find_spec(package) is None, f'{package} must not be a required dependency'
           import impulso
           print('impulso', impulso.__name__, '| pymc', m.version('pymc'), '| arviz', m.version('arviz'))
           for name in ['VAR', 'VARData', 'FittedVAR', 'IdentifiedVAR', 'ForecastResult', 'Cholesky']:

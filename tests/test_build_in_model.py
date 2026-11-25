@@ -1938,7 +1938,7 @@ class TestLatentStationarity:
         raises=TypeError,
         reason=(
             "Issue #404: with `n_lags >= 2` the gradient reshapes to a size that PyTensor computes at run time from "
-            "the shape of `B`, and JAX cannot trace that. The log-probability compiles: see "
+            "the shape of `B`, and JAX cannot compile that. The log-probability compiles: see "
             "`test_logp_compiles_under_jax`."
         ),
     )
