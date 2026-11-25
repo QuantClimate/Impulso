@@ -1515,12 +1515,13 @@ class VAR(ImpulsoBaseModel):
 
         To compute impulse responses and forecasts from the samples, turn them
         into a posterior with the block's `posterior_from_samples` and pass it
-        to `FittedVAR.from_posterior`; that method's docstring shows the whole
-        sequence.
+        to `FittedVAR.from_posterior`. The docstring of
+        `CompiledNumPyroBlock.posterior_from_samples` shows the whole sequence.
 
         The block's site names are not prefixed. To embed two VARs in one
         NumPyro model, call each block inside its own
-        `numpyro.handlers.scope(prefix=...)`.
+        `numpyro.handlers.scope(prefix=...)`. The recorded names then carry
+        the prefix, and `posterior_from_samples` needs them without it.
 
         Limitations:
 
@@ -1612,7 +1613,8 @@ class VAR(ImpulsoBaseModel):
         # `None` for it.
         recorded = {name: quantity for name, quantity in quantities.items() if quantity is not None}
         site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
-        # PyMC's own dimension names, or its defaults for a variable it gives none (`L`).
+        # PyMC's own dimension names, or its defaults for a variable it gives
+        # none: `L_dim_0` and `L_dim_1` for `L`, and none for the scalar `nu`.
         dimension_names = {
             name: tuple(model.named_vars_to_dims.get(name) or (f"{name}_dim_{i}" for i in range(variable.ndim)))
             for name, variable in recorded.items()

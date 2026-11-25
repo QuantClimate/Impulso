@@ -82,14 +82,19 @@ class CompiledNumPyroBlock:
             recorded quantities, in `recorded_names` order.
         dimension_names: Dimension names of each recorded quantity, keyed by
             its recorded name, without the sample dimensions `chain` and
-            `draw`. They are the PyMC model's own (`B` on `("var", "coeff")`);
-            a quantity the PyMC model gives no dimension names gets PyMC's
-            default ones, `{name}_dim_0`, `{name}_dim_1`, and so on.
+            `draw`. They are the PyMC model's own (`B` on `("var", "coeff")`;
+            an intercept for a strict subset of equations on
+            `("var_intercept",)`); a quantity the PyMC model gives no
+            dimension names gets PyMC's default ones, `{name}_dim_0`,
+            `{name}_dim_1`, and so on, and the scalar `nu` gets none.
         coordinate_labels: Labels along each dimension in
             `dimension_names` that the PyMC model labels, keyed by dimension
             name: the variable names on `"var"`, the lag-major `L{lag}.{name}`
-            labels on `"coeff"`, and so on. Together with `dimension_names`
-            they are the `coords` and `dims` of the PyMC model.
+            labels on `"coeff"`, the exogenous names on `"exog"`, and the
+            equations that have an intercept on `"var_intercept"`. Together
+            with `dimension_names` they are the PyMC model's `coords` and
+            `dims` for the recorded quantities. `posterior_from_samples` uses
+            both.
     """
 
     numpyro_site_names: Mapping[str, str]
@@ -164,16 +169,21 @@ class CompiledNumPyroBlock:
           default dimension names `{name}_dim_0`, `{name}_dim_1`, and so on.
           `FittedVAR.from_posterior` reads none of them.
 
-        It leaves out the block's own sample sites (`numpyro_site_names`):
-        they hold the VAR's parameters on PyMC's unconstrained scale, which
-        the posterior schema does not read, and their names contain `/`,
-        which ArviZ 1 refuses in a variable name.
+        It leaves out the block's own sites: the sample sites in
+        `numpyro_site_names`, which hold the VAR's parameters on PyMC's
+        unconstrained scale and whose names contain `/`, which ArviZ 1
+        refuses in a variable name; and the log-density site.
 
-        `FittedVAR.from_posterior` needs a `VARData` (ADR-0016): pass the
-        series given to the block as `endog`, with the `endog_names`, `exog`
-        and `exog_names` the block was compiled with. Under Student-t errors,
-        also pass `error_dist=spec.resolved_error_dist`; without it
-        `FittedVAR.from_posterior` treats the errors as Gaussian.
+        Two arguments of `FittedVAR.from_posterior` are the caller's to get
+        right:
+
+        - `data`, a `VARData` (ADR-0016): the series given to the block as
+          `endog`, with the `endog_names`, `exog` and `exog_names` the block
+          was compiled with.
+        - `error_dist=spec.resolved_error_dist`, as in the example. Under
+          Student-t errors, leaving it out makes `FittedVAR.from_posterior`
+          accept the posterior as Gaussian, so forecasts draw Gaussian
+          innovations.
 
         Args:
             samples: NumPyro samples keyed by site name, each with a chain
@@ -209,7 +219,7 @@ class CompiledNumPyroBlock:
                     f"{2 + len(dims)} axes: {', '.join(('chain', 'draw', *dims))}. Pass "
                     "`mcmc.get_samples(group_by_chain=True)`, which keeps the chains apart."
                 )
-        block_sites = set(self.numpyro_site_names.values())
+        block_sites = {*self.numpyro_site_names.values(), LOG_DENSITY_SITE}
         variables = {}
         for name, value in samples.items():
             if name in block_sites:
