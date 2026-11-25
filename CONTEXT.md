@@ -138,7 +138,7 @@ Registering a VAR into a PyMC model someone else owns, rather than the fresh mod
 _Avoid_: "custom VAR" or "VAR inside the MMM" for the mechanism: the host model is incidental. Avoid "prefix" as an Impulso option: namespacing comes from the caller's nested `pm.Model(name=...)`, and coordinates are not namespaced at all.
 
 **Compiled NumPyro block (`compile_for_numpyro`)**:
-A VAR whose PyMC model is built once by the embedded path and compiled to JAX, then called inside a NumPyro model with `endog`. A call adds the VAR's log-density to the NumPyro model and records the posterior-schema quantities. No NumPyro code is written for the VAR, so the PyMC model stays its only definition, and the route runs one way, PyMC to NumPyro.
+A VAR whose PyMC model is built once by the embedded path and compiled to JAX, then called inside a NumPyro model with `endog`. A call adds the VAR's log-density to the NumPyro model and records the posterior-schema quantities. No NumPyro code is written for the VAR, so the PyMC model stays its only definition, and the route runs one way, PyMC to NumPyro (ADR-0018).
 _Avoid_: "NumPyro VAR" or "NumPyro backend": there is no second implementation, and `VAR.fit` does not sample with NumPyro.
 
 **Latent endogenous series**:
@@ -201,6 +201,7 @@ _Avoid_: "extra lags" without saying they are untested; "corrected for non-stati
 - A **FittedVAR** answers **Granger causality** queries on its own — the coefficients are reduced-form and carry no time dimension, so neither an identification scheme nor an `at` is involved. The query never refits; it selects which of the already-fitted lags are tested.
 - **Toda-Yamamoto augmentation** consumes an **integration order**, fits the augmented lag order with a **ConjugateVAR**, and produces the same result object the `FittedVAR` query does — which is why the manual route is equivalent, and is the documented escape hatch for exogenous regressors, NUTS, and stochastic volatility.
 - A **VAR** registers itself into a host model through the **embedded path**. The host owns sampling. `FittedVAR.from_posterior` turns a posterior into a **FittedVAR** after checking the **posterior schema**, by exact unprefixed names against a `VARData`. An embedding caller must first return its posterior to that schema: strip the nested-model prefix, and supply a `VARData`, with a plug-in column (e.g. the posterior-mean path) standing in for each latent series (ADR-0016).
+- A **compiled NumPyro block** is the **embedded path** compiled for NumPyro: the compile step calls `build_in_model` with a symbolic `endog`, so the embedded path's refusals and caller obligations apply to it. The NumPyro model owns sampling. `FittedVAR.from_posterior` turns the NumPyro posterior into a **FittedVAR** once the block's `posterior_from_samples` has given it the **posterior schema**'s names and dimension names (ADR-0018).
 - A **latent endogenous series** exists only on the **embedded path**. Its **latent block** carries the **stationarity constraint**, and latent series require Gaussian errors and constant volatility.
 - A **ConjugateVAR** carries an **NIW prior** and optionally a **deterministic volatility break**; a **VAR** carries a **MinnesotaPrior** and a PyMC volatility process. Each estimator's fields accept only its compatible components, enforced by types and validators rather than a builder.
 
