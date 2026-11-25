@@ -14,6 +14,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
+
 from impulso._posterior import COEFFICIENTS, INTERCEPT
 
 if TYPE_CHECKING:
@@ -24,6 +26,29 @@ UNCONSTRAINED_SITE_PREFIX = "unconstrained/"
 
 LOG_DENSITY_SITE = "VAR_log_density"
 """Name of the `numpyro.factor` site that adds the VAR's joint log-density."""
+
+
+def add_with_zero_gradient(
+    log_density: Callable[..., Any], zero_gradient_term: Callable[..., Any]
+) -> Callable[..., Any]:
+    """Add `zero_gradient_term` to `log_density`, so that JAX passes the term no gradient.
+
+    Both arguments are JAX functions that take the same inputs and return a
+    one-element sequence, as `pymc.sampling.jax.get_jaxified_graph` compiles
+    them. The returned function takes those inputs and returns a one-element
+    sequence holding the sum. `zero_gradient_term` sees `jax.lax.stop_gradient`
+    copies of the inputs, so JAX never differentiates it: its value counts and
+    its gradient is zero. That is the gradient of a term that is constant
+    wherever it is finite, such as the `latent_stationarity` Potential.
+    """
+
+    def total(*inputs: Any) -> list[Any]:
+        import jax
+
+        held = [jax.lax.stop_gradient(value) for value in inputs]
+        return [log_density(*inputs)[0] + zero_gradient_term(*held)[0]]
+
+    return total
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -50,6 +75,11 @@ class VARModelValues:
             the factor of the scale matrix, not of the covariance (ADR-0007).
         nu: Degrees of freedom of the Student-t errors, a scalar, whether
             inferred or fixed; `None` under Gaussian errors.
+        latent: The generated latent paths, shape `(T, n_latent)` including
+            the initial values; `None` without latent series. Its columns
+            follow `latent_names`.
+        latent_names: Names of the latent series, in the column order of
+            `latent`; empty without latent series.
     """
 
     intercept: Any = None
@@ -57,6 +87,8 @@ class VARModelValues:
     B_exog: Any = None
     L: Any
     nu: Any = None
+    latent: Any = None
+    latent_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -77,7 +109,8 @@ class CompiledNumPyroBlock:
         log_density: JAX function from the value of every site (in
             `numpyro_site_names` order) and `endog` to a one-element sequence
             holding the VAR's joint log-density, PyMC's transform corrections
-            included.
+            included. JAX passes the `latent_stationarity` Potential, when
+            there is one, no gradient (see `add_with_zero_gradient`).
         recorded_quantities: JAX function from the same inputs to the
             recorded quantities, in `recorded_names` order.
         dimension_names: Dimension names of each recorded quantity, keyed by
@@ -95,6 +128,14 @@ class CompiledNumPyroBlock:
             with `dimension_names` they are the PyMC model's `coords` and
             `dims` for the recorded quantities. `posterior_from_samples` uses
             both.
+        initial_point: PyMC's initial point of the VAR's parameters, keyed by
+            NumPyro site name, on PyMC's unconstrained scale. Pass it to
+            NumPyro's `init_to_value(values=...)` to start the sampler where
+            PyMC would.
+        latent_names: Names of the latent series, in the column order of the
+            recorded `latent` paths; empty without latent series.
+        n_endog_rows: Number of rows of the `endog` every call must receive,
+            or `None` when a call accepts an `endog` of any length.
     """
 
     numpyro_site_names: Mapping[str, str]
@@ -104,6 +145,9 @@ class CompiledNumPyroBlock:
     recorded_quantities: Callable[..., Any]
     dimension_names: Mapping[str, tuple[str, ...]]
     coordinate_labels: Mapping[str, tuple[str, ...]]
+    initial_point: Mapping[str, np.ndarray]
+    latent_names: tuple[str, ...] = ()
+    n_endog_rows: int | None = None
 
     def __call__(self, endog: Any) -> VARModelValues:
         """Add the VAR to the NumPyro model being run, with `endog` as its data.
@@ -115,10 +159,20 @@ class CompiledNumPyroBlock:
         Returns:
             The recorded quantities' values at the NumPyro model's current
             parameter values.
+
+        Raises:
+            ValueError: If the block was compiled with `n_endog_rows` and
+                `endog` has another number of rows.
         """
         import numpyro
         import numpyro.distributions as dist
 
+        n_rows = np.shape(endog)[0]
+        if self.n_endog_rows is not None and n_rows != self.n_endog_rows:
+            raise ValueError(
+                f"endog has {n_rows} rows, but the block was compiled for {self.n_endog_rows} "
+                f"(n_endog_rows): compile a block with n_endog_rows={n_rows} for this endog."
+            )
         values = [
             numpyro.sample(site, dist.ImproperUniform(dist.constraints.real, (), self.site_shapes[site]))
             for site in self.numpyro_site_names.values()
@@ -127,7 +181,7 @@ class CompiledNumPyroBlock:
         recorded = dict(zip(self.recorded_names, self.recorded_quantities(*values, endog), strict=True))
         for name, value in recorded.items():
             numpyro.deterministic(name, value)
-        return VARModelValues(**recorded)
+        return VARModelValues(**recorded, latent_names=self.latent_names)
 
     def posterior_from_samples(self, samples: Mapping[str, Any]) -> "InferenceDataLike":
         """Turn NumPyro samples of a model that calls this block into a posterior for `FittedVAR.from_posterior`.
@@ -179,7 +233,9 @@ class CompiledNumPyroBlock:
 
         - `data`, a `VARData` (ADR-0016): the series given to the block as
           `endog`, with the `endog_names`, `exog` and `exog_names` the block
-          was compiled with.
+          was compiled with. With latent series it also needs a plug-in
+          column for each latent series, ahead of the observed ones, such as
+          the posterior mean of `latent`.
         - `error_dist=spec.resolved_error_dist`, as in the example. Under
           Student-t errors, leaving it out makes `FittedVAR.from_posterior`
           accept the posterior as Gaussian, so forecasts draw Gaussian
