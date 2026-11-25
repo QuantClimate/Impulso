@@ -46,6 +46,9 @@ _ERROR_DIST_REGISTRY: dict[str, type] = {
 # substitutes a scale derived from the column's level instead.
 _EXOG_SD_FLOOR_FRACTION: float = 1e-3
 
+# Name of the Potential that keeps the latent block stationary (ADR-0016).
+_LATENT_STATIONARITY = "latent_stationarity"
+
 
 def _validate_sigma_is_usable(
     sigma: np.ndarray,
@@ -517,7 +520,7 @@ def _register_latent_stationarity(B: Any, n_latent: int, n_vars: int, n_lags: in
     size = n_latent * n_lags
     matrix = pt.switch(pt.all(~(pt.isnan(matrix) | pt.isinf(matrix))), matrix, 2.0 * pt.eye(size))
     radius = spectral_radius(matrix)
-    pm.Potential("latent_stationarity", pt.switch(pt.lt(radius, 1.0), np.float64(0.0), np.float64(-np.inf)))
+    pm.Potential(_LATENT_STATIONARITY, pt.switch(pt.lt(radius, 1.0), np.float64(0.0), np.float64(-np.inf)))
 
 
 def _scan(fn: Any, **kwargs: Any) -> "pt.TensorVariable":
@@ -1160,7 +1163,10 @@ class VAR(ImpulsoBaseModel):
         the transformed space and stays inside the region. Prior predictive
         draws of the own lag come from the truncated prior, so
         prior-predictive latent paths are stationary. There is no `eig` in
-        the graph, so the JAX backend can differentiate the model. The
+        the graph, so `jax.grad` can differentiate the model's log density
+        compiled to JAX, as PyMC's NumPyro sampler does. PyTensor's own
+        gradient compiled to JAX (`compile_dlogp(mode="JAX")`) needs PyTensor
+        2.36 or later, which converts the gradient of a `scan` to JAX. The
         truncation's normalising constant is part of the model's log
         density.
 
@@ -1460,6 +1466,9 @@ class VAR(ImpulsoBaseModel):
         exog_names: Sequence[str] | None = None,
         endog_scales: np.ndarray | Sequence[float] | None = None,
         intercept_equations: Sequence[str] | None = None,
+        latent_names: Sequence[str] = (),
+        latent_init_sigma: float | Sequence[float] = 1.0,
+        n_endog_rows: int | None = None,
     ) -> "CompiledNumPyroBlock":
         """Compile this VAR once, for use inside a NumPyro model.
 
@@ -1468,10 +1477,11 @@ class VAR(ImpulsoBaseModel):
         `endog`, and compiles two JAX functions from that model with PyMC's
         JAX compilation, the one `pymc.sample(nuts_sampler="numpyro")` uses:
         the joint log-density, as a function of the VAR's parameter values
-        and `endog`; and the map from the same inputs to `B`, `intercept` and
-        `L`. It returns them as a `CompiledNumPyroBlock`. The PyMC model is
-        built and compiled here, once, and never inside the NumPyro model
-        function, however often NumPyro traces it.
+        and `endog`; and the map from the same inputs to `B`, `intercept`,
+        `L` and, with latent series, the generated `latent` paths. It returns
+        them as a `CompiledNumPyroBlock`. The PyMC model is built and
+        compiled here, once, and never inside the NumPyro model function,
+        however often NumPyro traces it.
 
         Call the returned block inside a NumPyro model function, passing
         `endog`: observed data, or an array the NumPyro model generated. Each
@@ -1487,9 +1497,11 @@ class VAR(ImpulsoBaseModel):
           the NumPyro model with `numpyro.factor`. It keeps PyMC's transform
           correction terms, so NumPyro's log-density of the model equals
           PyMC's log-density at the same parameter values;
-        - records `B`, `intercept` and `L` with `numpyro.deterministic`,
-          under their unprefixed posterior-schema names;
-        - returns them as a `VARModelValues`.
+        - records `B`, `intercept`, `L` and, with latent series, `latent`
+          with `numpyro.deterministic`, under their unprefixed
+          posterior-schema names;
+        - returns them as a `VARModelValues`, together with the latent
+          series' names in the column order of `latent`.
 
         ```python
         block = VAR(lags=2).compile_for_numpyro(
@@ -1508,6 +1520,38 @@ class VAR(ImpulsoBaseModel):
         NumPyro model, call each block inside its own
         `numpyro.handlers.scope(prefix=...)`.
 
+        Latent series: `latent_names` and `latent_init_sigma` declare latent
+        endogenous series as in `build_in_model`: they come first in
+        `endog_names`, and the `endog` each call receives holds only the
+        observed columns. The latent paths are generated inside the block,
+        and JAX needs their length when it compiles them, so this method then
+        also takes `n_endog_rows`, the number of rows of that `endog`, and
+        every call must pass an `endog` with that many rows. The latent
+        block is kept stationary as in PyMC (ADR-0016, ADR-0017): with one
+        latent series and `n_lags=1` through the truncated own lag, and
+        otherwise through the `latent_stationarity` Potential, which makes
+        NumPyro's log-density -inf outside the stationary region. The
+        Potential's gradient is zero, as in PyMC: the block adds it to the
+        log-density on `jax.lax.stop_gradient` copies of its inputs, because
+        JAX cannot differentiate the eigendecomposition inside it.
+
+        Initial values: NumPyro sets initial values on the sampler, not in
+        the model, so the block exposes PyMC's initial point as
+        `block.initial_point`, keyed by site name on the unconstrained scale.
+        Pass `numpyro.infer.init_to_value(values=block.initial_point)` as
+        `NUTS`'s `init_strategy`. With latent series this matters:
+        when a latent own-lag prior mean lies outside the stationary region,
+        the default of 1 included, PyMC's initial point moves `B` inside it
+        (ADR-0016), whereas NumPyro's default random start can fall outside
+        it and has to retry. `init_to_value` does not jitter, so every chain
+        starts at the same point. Inside `numpyro.handlers.scope(prefix=...)`,
+        prefix the keys the same way.
+
+        Handing the posterior to `FittedVAR`: `FittedVAR.from_posterior`
+        needs a `VARData`, and with latent series that `VARData` needs a
+        plug-in column for each latent series, such as its posterior-mean
+        path (ADR-0016).
+
         Limitations:
 
         - NumPyro cannot draw the VAR's parameters, because their sites have
@@ -1525,9 +1569,15 @@ class VAR(ImpulsoBaseModel):
         - The embedded-path refusals of `build_in_model` apply, because
           `endog` is symbolic at compile time: `self.lags` must be an integer,
           not a selection criterion string; `self.volatility` must be
-          constant volatility; and `endog_scales` is required. This method
-          raises them, with `build_in_model`'s messages, before compiling
-          anything.
+          constant volatility; `endog_scales` is required; and latent series
+          require Gaussian errors. This method raises them, with
+          `build_in_model`'s messages, before compiling anything.
+        - Under JAX the latent-block stationarity constraint computes its
+          non-symmetric eigendecomposition on the CPU. JAX implements that
+          eigendecomposition only for CPU and GPU, and on a GPU it calls
+          LAPACK on the host CPU by default (see `jax.lax.linalg.eig`). On a
+          TPU it does not run. No GPU run has been tested. One latent series
+          with `n_lags=1` has no such constraint.
 
         Importing PyTensor's JAX backend switches JAX to 64-bit floats
         (`jax_enable_x64`) when PyTensor's `floatX` is `float64`, its default.
@@ -1537,7 +1587,8 @@ class VAR(ImpulsoBaseModel):
                 at compile time (see Limitations).
             n_lags: Lag order, a concrete integer.
             endog_names: Names of the endogenous variables, length `n_vars`,
-                in the column order of the `endog` each call receives.
+                in VAR order: latent series first, then the columns of the
+                `endog` each call receives.
             exog_names: Names of the exogenous columns. Required when `exog`
                 is given.
             endog_scales: Per-variable scale, shape `(n_vars,)`, shared by the
@@ -1545,6 +1596,16 @@ class VAR(ImpulsoBaseModel):
             intercept_equations: Names of the equations that get an
                 intercept, as in `build_in_model`. `None` (the default) means
                 every equation.
+            latent_names: Names of the latent endogenous series, the first
+                entries of `endog_names`, as in `build_in_model`. Empty (the
+                default) means no latent series.
+            latent_init_sigma: Standard deviation of the zero-mean Normal
+                prior on each latent series' first `n_lags` values, as in
+                `build_in_model`. Ignored without latent series.
+            n_endog_rows: Number of rows of the `endog` every call of the
+                block receives. Required with latent series. `None` (the
+                default) lets a call without latent series receive an
+                `endog` of any length.
 
         Returns:
             The compiled NumPyro block.
@@ -1554,6 +1615,7 @@ class VAR(ImpulsoBaseModel):
                 names the missing packages.
             ValueError: `build_in_model`'s refusals for a symbolic `endog`
                 (see Limitations), and its other argument checks.
+            ValueError: If `latent_names` is given without `n_endog_rows`.
         """
         require_all("jax", "numpyro", extra="numpyro")
 
@@ -1562,13 +1624,14 @@ class VAR(ImpulsoBaseModel):
         import pytensor.tensor as pt
         from pymc.sampling.jax import get_jaxified_graph
 
-        from impulso.numpyro_block import UNCONSTRAINED_SITE_PREFIX, CompiledNumPyroBlock
+        from impulso.numpyro_block import UNCONSTRAINED_SITE_PREFIX, CompiledNumPyroBlock, add_with_zero_gradient
 
-        # The row count is left unknown so one block accepts an `endog` of any
-        # length; JAX fixes it when it traces a call. The column count is
-        # static so `build_in_model` checks it against `endog_names`. An
-        # unnamed model keeps every name unprefixed.
-        endog = pt.tensor("endog", shape=(None, len(endog_names)), dtype=pytensor.config.floatX)
+        # Without `n_endog_rows` the row count is left unknown, so one block
+        # accepts an `endog` of any length; JAX fixes it when it traces a
+        # call. The column count is static so `build_in_model` checks it
+        # against `endog_names`. An unnamed model keeps every name unprefixed.
+        n_observed = len(endog_names) - len(latent_names)
+        endog = pt.tensor("endog", shape=(n_endog_rows, n_observed), dtype=pytensor.config.floatX)
         with pm.Model() as model:
             handles = self.build_in_model(
                 endog=endog,
@@ -1578,25 +1641,54 @@ class VAR(ImpulsoBaseModel):
                 exog_names=exog_names,
                 endog_scales=endog_scales,
                 intercept_equations=intercept_equations,
+                latent_names=latent_names,
+                latent_init_sigma=latent_init_sigma,
+            )
+        # A `scan` of unknown length cannot run under `jax.jit`, which NumPyro
+        # always applies, so the latent paths need a fixed length.
+        if handles.latent is not None and n_endog_rows is None:
+            raise ValueError(
+                "n_endog_rows is required when latent_names is given: JAX needs the length of the latent paths "
+                "when it compiles them. Pass the number of rows of the endog each call of the block receives."
             )
 
         inputs = [*model.value_vars, endog]
+        # The log-density sums the priors, the Potentials (the likelihood
+        # `obs` among them) and the transforms' correction terms. The
+        # `latent_stationarity` Potential is 0 inside the stationary region
+        # and -inf outside, so its gradient is zero; PyMC gets that zero from
+        # a gradient override. PyTensor's JAX conversion inlines the override,
+        # and JAX cannot differentiate the eigendecomposition inside it, so
+        # the Potential is compiled on its own and added with a zero gradient.
+        stationarity = [potential for potential in model.potentials if potential.name == _LATENT_STATIONARITY]
+        rest = [*model.basic_RVs, *(potential for potential in model.potentials if potential not in stationarity)]
+        log_density = get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=rest)])
+        if stationarity:
+            log_density = add_with_zero_gradient(
+                log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=stationarity)])
+            )
         recorded = {INTERCEPT: handles.intercept, COEFFICIENTS: handles.B, "L": handles.L}
+        if handles.latent is not None:
+            recorded["latent"] = handles.latent
         site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
+        # On the unconstrained scale, keyed by value-variable name. It holds
+        # the stationary start `B` gets with latent series (ADR-0016).
+        initial_point = model.initial_point()
         return CompiledNumPyroBlock(
             numpyro_site_names=site_names,
             # PyMC gives some value variables no static shape (`B`'s among
             # them), so the shapes come from evaluating the initial point.
-            site_shapes={site_names[name]: np.shape(value) for name, value in model.initial_point().items()},
+            site_shapes={site_names[name]: np.shape(value) for name, value in initial_point.items()},
             recorded_names=tuple(recorded),
-            # `model.logp()` sums the priors, the Potentials (the likelihood
-            # `obs` among them) and the transforms' correction terms.
-            log_density=get_jaxified_graph(inputs=inputs, outputs=[model.logp()]),
+            log_density=log_density,
             # Rewritten in terms of the value variables, undoing their
             # transforms, so the function reads its inputs instead of drawing.
             recorded_quantities=get_jaxified_graph(
                 inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
             ),
+            initial_point={site_names[name]: value for name, value in initial_point.items()},
+            latent_names=handles.latent_names,
+            n_endog_rows=n_endog_rows,
         )
 
     def _build_pymc_model(self, data: VARData) -> tuple[Any, int]:
