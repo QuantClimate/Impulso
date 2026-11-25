@@ -1468,10 +1468,11 @@ class VAR(ImpulsoBaseModel):
         `endog`, and compiles two JAX functions from that model with PyMC's
         JAX compilation, the one `pymc.sample(nuts_sampler="numpyro")` uses:
         the joint log-density, as a function of the VAR's parameter values
-        and `endog`; and the map from the same inputs to `B`, `intercept` and
-        `L`. It returns them as a `CompiledNumPyroBlock`. The PyMC model is
-        built and compiled here, once, and never inside the NumPyro model
-        function, however often NumPyro traces it.
+        and `endog`; and the map from the same inputs to `B`, `intercept`,
+        `B_exog`, `L` and, under Student-t errors, `nu`. It returns them as a
+        `CompiledNumPyroBlock`. The PyMC model is built and compiled here,
+        once, and never inside the NumPyro model function, however often
+        NumPyro traces it.
 
         Call the returned block inside a NumPyro model function, passing
         `endog`: observed data, or an array the NumPyro model generated. Each
@@ -1487,9 +1488,17 @@ class VAR(ImpulsoBaseModel):
           the NumPyro model with `numpyro.factor`. It keeps PyMC's transform
           correction terms, so NumPyro's log-density of the model equals
           PyMC's log-density at the same parameter values;
-        - records `B`, `intercept` and `L` with `numpyro.deterministic`,
-          under their unprefixed posterior-schema names;
-        - returns them as a `VARModelValues`.
+        - records `B`, `intercept`, `B_exog`, `L` and `nu` with
+          `numpyro.deterministic`, under their unprefixed posterior-schema
+          names. A quantity the VAR does not have is not recorded: `intercept`
+          when `intercept_equations` is empty, `B_exog` when `exog` is `None`,
+          and `nu` under Gaussian errors. Under Student-t errors `nu` is
+          recorded whether the degrees of freedom are inferred or fixed, and
+          `L` factors the scale matrix, not the covariance (ADR-0007). With a
+          strict-subset `intercept_equations`, `intercept` covers only the
+          included equations, as PyMC's does;
+        - returns them as a `VARModelValues`, with `None` for each quantity
+          not recorded, as `VARModelHandles` has.
 
         ```python
         block = VAR(lags=2).compile_for_numpyro(
@@ -1549,7 +1558,7 @@ class VAR(ImpulsoBaseModel):
                 Minnesota cross-lag prior and the exogenous prior. Required.
             intercept_equations: Names of the equations that get an
                 intercept, as in `build_in_model`. `None` (the default) means
-                every equation.
+                every equation; an empty sequence means none.
 
         Returns:
             The compiled NumPyro block.
@@ -1586,7 +1595,22 @@ class VAR(ImpulsoBaseModel):
             )
 
         inputs = [*model.value_vars, endog]
-        recorded = {INTERCEPT: handles.intercept, COEFFICIENTS: handles.B, "L": handles.L}
+        # The posterior schema reads `nu` exactly when the error distribution
+        # is heavy-tailed. The Student-t adapter registers it as the
+        # Deterministic "nu" whether the degrees of freedom are inferred or
+        # fixed.
+        degrees_of_freedom = model["nu"] if self.resolved_error_dist.is_heavy_tailed else None
+        quantities = {
+            INTERCEPT: handles.intercept,
+            COEFFICIENTS: handles.B,
+            EXOG_COEFFICIENTS: handles.B_exog,
+            "L": handles.L,
+            "nu": degrees_of_freedom,
+        }
+        # A quantity the model does not have (no intercept, no exogenous
+        # regressors, Gaussian errors) is not recorded, and the call returns
+        # `None` for it.
+        recorded = {name: quantity for name, quantity in quantities.items() if quantity is not None}
         site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
         # PyMC's own dimension names, or its defaults for a variable it gives none (`L`).
         dimension_names = {
