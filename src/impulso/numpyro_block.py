@@ -16,10 +16,19 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from impulso._posterior import COEFFICIENTS, INTERCEPT
+from impulso._posterior import (
+    CHOLESKY_FACTOR,
+    COEFFICIENTS,
+    DEGREES_OF_FREEDOM,
+    EXOG_COEFFICIENTS,
+    INTERCEPT,
+    LATENT_PATHS,
+)
+from impulso._zero_gradient import has_zero_gradient
 
 if TYPE_CHECKING:
     from impulso._arviz_compat import InferenceDataLike
+    from impulso.spec import VARModelHandles
 
 UNCONSTRAINED_SITE_PREFIX = "unconstrained/"
 """Prefix of the NumPyro site holding each PyMC value variable, on PyMC's unconstrained scale."""
@@ -33,22 +42,44 @@ def add_with_zero_gradient(
 ) -> Callable[..., Any]:
     """Add `zero_gradient_term` to `log_density`, so that JAX passes the term no gradient.
 
-    Both arguments are JAX functions that take the same inputs and return a
-    one-element sequence, as `pymc.sampling.jax.get_jaxified_graph` compiles
-    them. The returned function takes those inputs and returns a one-element
-    sequence holding the sum. `zero_gradient_term` sees `jax.lax.stop_gradient`
-    copies of the inputs, so JAX never differentiates it: its value counts and
-    its gradient is zero. That is the gradient of a term that is constant
-    wherever it is finite, such as the `latent_stationarity` Potential.
+    `zero_gradient_term` sees `jax.lax.stop_gradient` copies of the inputs, so
+    JAX never differentiates it: its value counts and its gradient is zero.
+    That is the gradient of a term that is constant wherever it is finite,
+    such as the `latent_stationarity` Potential.
+
+    Args:
+        log_density: JAX function, as `pymc.sampling.jax.get_jaxified_graph`
+            compiles it, from some inputs to a one-element sequence holding a
+            log-density.
+        zero_gradient_term: JAX function of the same form, from the same
+            inputs, holding the term to add.
+
+    Returns:
+        JAX function from those inputs to a one-element sequence holding the
+        sum of the two.
     """
 
     def total(*inputs: Any) -> list[Any]:
         import jax
 
-        held = [jax.lax.stop_gradient(value) for value in inputs]
-        return [log_density(*inputs)[0] + zero_gradient_term(*held)[0]]
+        inputs_without_gradient = [jax.lax.stop_gradient(value) for value in inputs]
+        return [log_density(*inputs)[0] + zero_gradient_term(*inputs_without_gradient)[0]]
 
     return total
+
+
+def _default_dimension_names(name: str, n_dims: int) -> tuple[str, ...]:
+    """PyMC's default dimension names for a variable that the model gives none.
+
+    Args:
+        name: Name of the variable.
+        n_dims: Number of its dimensions, without the sample dimensions
+            `chain` and `draw`.
+
+    Returns:
+        `{name}_dim_0`, `{name}_dim_1`, and so on, one per dimension.
+    """
+    return tuple(f"{name}_dim_{i}" for i in range(n_dims))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -95,23 +126,26 @@ class VARModelValues:
 class CompiledNumPyroBlock:
     """A VAR compiled once from its PyMC model, called inside a NumPyro model.
 
-    Built by `VAR.compile_for_numpyro`; see that method for what a call adds to
-    the NumPyro model and for the limitations.
+    Built by `VAR.compile_for_numpyro`, through `from_pymc_model`; see
+    `VAR.compile_for_numpyro` for what a call adds to the NumPyro model and
+    for the limitations.
 
     Attributes:
         numpyro_site_names: NumPyro sample-site name of each PyMC value
-            variable, keyed by the value variable's name. Each site holds that
-            variable on PyMC's unconstrained scale.
+            variable, keyed by the value variable's name. A PyMC value
+            variable is the unconstrained value of one free parameter of the
+            PyMC model, and its site holds it on that scale.
         site_shapes: Shape of each site's value, keyed by NumPyro site name.
-        recorded_names: Names under which a call records the VAR quantities
-            with `numpyro.deterministic`, in the order of
-            `recorded_quantities`'s outputs.
+        recorded_names: Names under which a call records the recorded
+            quantities with `numpyro.deterministic`, in the order of
+            `compute_recorded_quantities`'s outputs.
         log_density: JAX function from the value of every site (in
             `numpyro_site_names` order) and `endog` to a one-element sequence
             holding the VAR's joint log-density, PyMC's transform corrections
-            included. JAX passes the `latent_stationarity` Potential, when
-            there is one, no gradient (see `add_with_zero_gradient`).
-        recorded_quantities: JAX function from the same inputs to the
+            included. JAX passes every term that the PyMC model gives a
+            zero-gradient override, such as the `latent_stationarity`
+            Potential, no gradient (see `add_with_zero_gradient`).
+        compute_recorded_quantities: JAX function from the same inputs to the
             recorded quantities, in `recorded_names` order.
         dimension_names: Dimension names of each recorded quantity, keyed by
             its recorded name, without the sample dimensions `chain` and
@@ -142,12 +176,102 @@ class CompiledNumPyroBlock:
     site_shapes: Mapping[str, tuple[int, ...]]
     recorded_names: tuple[str, ...]
     log_density: Callable[..., Any]
-    recorded_quantities: Callable[..., Any]
+    compute_recorded_quantities: Callable[..., Any]
     dimension_names: Mapping[str, tuple[str, ...]]
     coordinate_labels: Mapping[str, tuple[str, ...]]
     initial_point: Mapping[str, np.ndarray]
     latent_names: tuple[str, ...] = ()
     n_endog_rows: int | None = None
+
+    @classmethod
+    def from_pymc_model(
+        cls,
+        model: Any,
+        endog: Any,
+        handles: "VARModelHandles",
+        *,
+        degrees_of_freedom: Any = None,
+        n_endog_rows: int | None = None,
+    ) -> "CompiledNumPyroBlock":
+        """Compile a VAR's PyMC model, built by `VAR.build_in_model` with a symbolic `endog`, into a block.
+
+        `VAR.compile_for_numpyro` builds the model and calls this constructor.
+
+        Args:
+            model: The `pymc.Model` that holds the VAR `build_in_model`
+                registered, and nothing else.
+            endog: The symbolic `endog` that `build_in_model` received. Both
+                compiled functions take it after the value of every site.
+            handles: The handles `build_in_model` returned.
+            degrees_of_freedom: The PyMC variable `nu`, the degrees of freedom
+                of the Student-t errors, under heavy-tailed errors; `None`
+                under Gaussian errors.
+            n_endog_rows: Number of rows of the `endog` every call of the
+                block must receive, or `None` when a call accepts an `endog`
+                of any length.
+
+        Returns:
+            The compiled block.
+        """
+        from pymc.sampling.jax import get_jaxified_graph
+
+        inputs = [*model.value_vars, endog]
+        # The log-density sums the priors, the Potentials (the likelihood
+        # `obs` among them) and the transforms' correction terms. PyMC gives a
+        # term declared with `declare_zero_gradient`, such as the
+        # `latent_stationarity` Potential, a zero gradient through a gradient
+        # override. PyTensor's JAX conversion drops the override, so the
+        # declared terms are compiled on their own and added with a zero
+        # gradient.
+        terms = [*model.basic_RVs, *model.potentials]
+        zero_gradient_terms = [term for term in terms if has_zero_gradient(term)]
+        differentiated_terms = [term for term in terms if not has_zero_gradient(term)]
+        log_density = get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=differentiated_terms)])
+        if zero_gradient_terms:
+            log_density = add_with_zero_gradient(
+                log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=zero_gradient_terms)])
+            )
+        quantities = {
+            INTERCEPT: handles.intercept,
+            COEFFICIENTS: handles.B,
+            EXOG_COEFFICIENTS: handles.B_exog,
+            CHOLESKY_FACTOR: handles.L,
+            DEGREES_OF_FREEDOM: degrees_of_freedom,
+            LATENT_PATHS: handles.latent,
+        }
+        # A quantity the model does not have (no intercept, no exogenous
+        # regressors, Gaussian errors, no latent series) is not recorded,
+        # and the call returns `None` for it.
+        recorded = {name: quantity for name, quantity in quantities.items() if quantity is not None}
+        site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
+        # On the unconstrained scale, keyed by value-variable name. It holds
+        # the stationary start `B` gets with latent series (ADR-0016).
+        initial_point = model.initial_point()
+        # PyMC's own dimension names, or its defaults for a variable it gives
+        # none: `L_dim_0` and `L_dim_1` for `L`, and none for the scalar `nu`.
+        dimension_names = {
+            name: tuple(model.named_vars_to_dims.get(name) or _default_dimension_names(name, variable.ndim))
+            for name, variable in recorded.items()
+        }
+        labelled = {dim for dims in dimension_names.values() for dim in dims if model.coords.get(dim) is not None}
+        return cls(
+            numpyro_site_names=site_names,
+            # PyMC gives some value variables no static shape (`B`'s among
+            # them), so the shapes come from evaluating the initial point.
+            site_shapes={site_names[name]: np.shape(value) for name, value in initial_point.items()},
+            recorded_names=tuple(recorded),
+            log_density=log_density,
+            # Rewritten in terms of the value variables, undoing their
+            # transforms, so the function reads its inputs instead of drawing.
+            compute_recorded_quantities=get_jaxified_graph(
+                inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
+            ),
+            dimension_names=dimension_names,
+            coordinate_labels={dim: tuple(model.coords[dim]) for dim in labelled},
+            initial_point={site_names[name]: value for name, value in initial_point.items()},
+            latent_names=handles.latent_names,
+            n_endog_rows=n_endog_rows,
+        )
 
     def __call__(self, endog: Any) -> VARModelValues:
         """Add the VAR to the NumPyro model being run, with `endog` as its data.
@@ -178,7 +302,7 @@ class CompiledNumPyroBlock:
             for site in self.numpyro_site_names.values()
         ]
         numpyro.factor(LOG_DENSITY_SITE, self.log_density(*values, endog)[0])
-        recorded = dict(zip(self.recorded_names, self.recorded_quantities(*values, endog), strict=True))
+        recorded = dict(zip(self.recorded_names, self.compute_recorded_quantities(*values, endog), strict=True))
         for name, value in recorded.items():
             numpyro.deterministic(name, value)
         return VARModelValues(**recorded, latent_names=self.latent_names)
@@ -263,7 +387,6 @@ class CompiledNumPyroBlock:
                 own sites would get the same name in the posterior once each
                 `/` is replaced by `.`, such as `user/scale` and `user.scale`.
         """
-        import numpy as np
         import xarray as xr
 
         from impulso._arviz_compat import make_idata
@@ -296,7 +419,7 @@ class CompiledNumPyroBlock:
                 )
             site_of_posterior_name[posterior_name] = name
             array = np.asarray(value)
-            dims = self.dimension_names.get(name, tuple(f"{posterior_name}_dim_{i}" for i in range(array.ndim - 2)))
+            dims = self.dimension_names.get(name, _default_dimension_names(posterior_name, array.ndim - 2))
             variables[posterior_name] = (("chain", "draw", *dims), array)
         variables[INTERCEPT] = (("chain", "draw", "var"), self._intercept_of_every_equation(samples))
         used_dims = {dim for dims, _ in variables.values() for dim in dims}
@@ -309,8 +432,6 @@ class CompiledNumPyroBlock:
         An equation that `intercept_equations` excluded has no recorded
         intercept, and its intercept is zero, as in the PyMC model's mean.
         """
-        import numpy as np
-
         variable_names = self.coordinate_labels["var"]
         recorded_dims = self.dimension_names.get(INTERCEPT)
         if recorded_dims == ("var",):

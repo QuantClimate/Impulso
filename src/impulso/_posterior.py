@@ -16,9 +16,11 @@ Variable layouts (all leading with the `(chain, draw)` sample dims):
 * ``B_exog`` — `(chain, draw, n, n_exog)`: contemporaneous exogenous
   coefficients; present only when the estimator consumed an exogenous block.
 
-Not owned here: the volatility seam's ``L`` (owned by `volatility.py` /
-`conjugate_volatility.py`) and the error-distribution seam's ``nu``
-(owned by `observation.py`).
+Not owned here: the layouts of the volatility seam's ``L`` (owned by
+`volatility.py` / `conjugate_volatility.py`) and the error-distribution
+seam's ``nu`` (owned by `observation.py`). Their names are spelled here,
+with the latent paths' ``latent``, so code that reads them by name shares
+one spelling.
 """
 
 from __future__ import annotations
@@ -39,6 +41,15 @@ INTERCEPT = "intercept"
 
 EXOG_COEFFICIENTS = "B_exog"
 """Exogenous-coefficient draws, `(chain, draw, n, n_exog)`; present only when consumed."""
+
+CHOLESKY_FACTOR = "L"
+"""Name of the constant-volatility Cholesky factor of the innovation scale matrix; its layout is `volatility.py`'s."""
+
+DEGREES_OF_FREEDOM = "nu"
+"""Name of the Student-t errors' degrees of freedom; its layout is `observation.py`'s."""
+
+LATENT_PATHS = "latent"
+"""Name of the generated latent-series paths, `(chain, draw, T, n_latent)`; present only with latent series."""
 
 
 def posterior_dataset(idata: InferenceDataLike) -> xr.Dataset:

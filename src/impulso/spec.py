@@ -12,8 +12,8 @@ from impulso._arviz_compat import InferenceDataLike
 from impulso._base import ImpulsoBaseModel
 from impulso._design import build_lag_design_matrix
 from impulso._optional import require_all
-from impulso._posterior import COEFFICIENTS, EXOG_COEFFICIENTS, INTERCEPT
-from impulso._zero_gradient import declare_zero_gradient, has_zero_gradient, zero_gradient_op
+from impulso._posterior import COEFFICIENTS, DEGREES_OF_FREEDOM, EXOG_COEFFICIENTS, INTERCEPT, LATENT_PATHS
+from impulso._zero_gradient import declare_zero_gradient, zero_gradient_op
 from impulso.data import VARData, _format_names
 from impulso.observation import Gaussian, StudentT
 from impulso.priors import MinnesotaPrior
@@ -607,7 +607,7 @@ def _latent_path(
         outputs_info=[{"initial": initial, "taps": list(range(-n_lags, 0))}],
         non_sequences=[A_lat],
     )
-    path = pm.Deterministic("latent", pt.concatenate([init, history], axis=0))
+    path = pm.Deterministic(LATENT_PATHS, pt.concatenate([init, history], axis=0))
     return path, z
 
 
@@ -1632,9 +1632,8 @@ class VAR(ImpulsoBaseModel):
         import pymc as pm
         import pytensor
         import pytensor.tensor as pt
-        from pymc.sampling.jax import get_jaxified_graph
 
-        from impulso.numpyro_block import UNCONSTRAINED_SITE_PREFIX, CompiledNumPyroBlock, add_with_zero_gradient
+        from impulso.numpyro_block import CompiledNumPyroBlock
 
         # Without `n_endog_rows` the row count is left unknown, so one block
         # accepts an `endog` of any length; JAX fixes it when it traces a
@@ -1662,67 +1661,13 @@ class VAR(ImpulsoBaseModel):
                 "when it compiles them. Pass the number of rows of the endog each call of the block receives."
             )
 
-        inputs = [*model.value_vars, endog]
-        # The log-density sums the priors, the Potentials (the likelihood
-        # `obs` among them) and the transforms' correction terms. PyMC gives a
-        # term declared with `declare_zero_gradient`, such as the
-        # `latent_stationarity` Potential, a zero gradient through a gradient
-        # override. PyTensor's JAX conversion drops the override, so the
-        # declared terms are compiled on their own and added with a zero
-        # gradient.
-        terms = [*model.basic_RVs, *model.potentials]
-        zero_gradient_terms = [term for term in terms if has_zero_gradient(term)]
-        differentiated_terms = [term for term in terms if not has_zero_gradient(term)]
-        log_density = get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=differentiated_terms)])
-        if zero_gradient_terms:
-            log_density = add_with_zero_gradient(
-                log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=zero_gradient_terms)])
-            )
         # The posterior schema reads `nu` exactly when the error distribution
         # is heavy-tailed. The Student-t adapter registers it as the
-        # Deterministic "nu" whether the degrees of freedom are inferred or
+        # Deterministic `nu` whether the degrees of freedom are inferred or
         # fixed.
-        degrees_of_freedom = model["nu"] if self.resolved_error_dist.is_heavy_tailed else None
-        quantities = {
-            INTERCEPT: handles.intercept,
-            COEFFICIENTS: handles.B,
-            EXOG_COEFFICIENTS: handles.B_exog,
-            "L": handles.L,
-            "nu": degrees_of_freedom,
-            "latent": handles.latent,
-        }
-        # A quantity the model does not have (no intercept, no exogenous
-        # regressors, Gaussian errors, no latent series) is not recorded,
-        # and the call returns `None` for it.
-        recorded = {name: quantity for name, quantity in quantities.items() if quantity is not None}
-        site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
-        # On the unconstrained scale, keyed by value-variable name. It holds
-        # the stationary start `B` gets with latent series (ADR-0016).
-        initial_point = model.initial_point()
-        # PyMC's own dimension names, or its defaults for a variable it gives
-        # none: `L_dim_0` and `L_dim_1` for `L`, and none for the scalar `nu`.
-        dimension_names = {
-            name: tuple(model.named_vars_to_dims.get(name) or (f"{name}_dim_{i}" for i in range(variable.ndim)))
-            for name, variable in recorded.items()
-        }
-        labelled = {dim for dims in dimension_names.values() for dim in dims if model.coords.get(dim) is not None}
-        return CompiledNumPyroBlock(
-            numpyro_site_names=site_names,
-            # PyMC gives some value variables no static shape (`B`'s among
-            # them), so the shapes come from evaluating the initial point.
-            site_shapes={site_names[name]: np.shape(value) for name, value in initial_point.items()},
-            recorded_names=tuple(recorded),
-            log_density=log_density,
-            # Rewritten in terms of the value variables, undoing their
-            # transforms, so the function reads its inputs instead of drawing.
-            recorded_quantities=get_jaxified_graph(
-                inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
-            ),
-            dimension_names=dimension_names,
-            coordinate_labels={dim: tuple(model.coords[dim]) for dim in labelled},
-            initial_point={site_names[name]: value for name, value in initial_point.items()},
-            latent_names=handles.latent_names,
-            n_endog_rows=n_endog_rows,
+        degrees_of_freedom = model[DEGREES_OF_FREEDOM] if self.resolved_error_dist.is_heavy_tailed else None
+        return CompiledNumPyroBlock.from_pymc_model(
+            model, endog, handles, degrees_of_freedom=degrees_of_freedom, n_endog_rows=n_endog_rows
         )
 
     def _build_pymc_model(self, data: VARData) -> tuple[Any, int]:
