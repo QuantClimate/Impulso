@@ -2,7 +2,7 @@
 
 `VAR.compile_for_numpyro` builds the VAR's PyMC model once and returns a
 `CompiledNumPyroBlock`. The block holds two JAX functions compiled from that
-model: the joint log-density, and the map to the quantities it records. No
+model: the joint log-density, and the map to the recorded quantities. No
 NumPyro code is written for the VAR itself (ADR-0016 keeps one model, defined
 in PyMC).
 
@@ -84,7 +84,7 @@ def _default_dimension_names(name: str, n_dims: int) -> tuple[str, ...]:
 
 @dataclass(frozen=True, kw_only=True)
 class VARModelValues:
-    """Values, as JAX arrays, of the VAR quantities a `CompiledNumPyroBlock` call records.
+    """Values, as JAX arrays, of the recorded quantities: the quantities a `CompiledNumPyroBlock` call records.
 
     The NumPyro counterpart of `VARModelHandles`: where those are PyMC
     variables, these are the values the block computed from the NumPyro
@@ -312,31 +312,14 @@ class CompiledNumPyroBlock:
 
         NumPyro samples carry no dimension names, and the posterior schema
         checks `B`, `intercept` and `B_exog` by dimension name. This method
-        names the sample axes `chain` and `draw` and gives each quantity the
-        block records its `dimension_names` and `coordinate_labels`. The
-        whole sequence, from compiling to impulse responses::
-
-            spec = VAR(lags=2)
-            block = spec.compile_for_numpyro(
-                exog=None, n_lags=2, endog_names=data.endog_names, endog_scales=impulso.ar1_residual_sd(data.endog)
-            )
-
-            def model(endog):
-                values = block(endog)  # values.B, values.intercept, values.L
-                ...  # the rest of the NumPyro model
-
-            mcmc = numpyro.infer.MCMC(
-                numpyro.infer.NUTS(model), num_warmup=500, num_samples=500, num_chains=2, chain_method="sequential"
-            )
-            mcmc.run(jax.random.key(0), data.endog)
-
-            posterior = block.posterior_from_samples(mcmc.get_samples(group_by_chain=True))
-            fitted = FittedVAR.from_posterior(posterior, data, n_lags=2, error_dist=spec.resolved_error_dist)
-            irf = fitted.set_identification_strategy(Cholesky(ordering=data.endog_names)).impulse_response()
+        names the sample axes `chain` and `draw` and gives each recorded
+        quantity its `dimension_names` and `coordinate_labels`. The example in
+        `VAR.compile_for_numpyro` shows the whole sequence, from compiling to
+        impulse responses.
 
         The posterior holds:
 
-        - each quantity the block records, under its posterior-schema name.
+        - each recorded quantity, under its posterior-schema name.
           The intercept has an entry for every equation, on `var`: an
           equation that `intercept_equations` excluded gets zero, as in the
           PyMC model's mean;
@@ -363,10 +346,11 @@ class CompiledNumPyroBlock:
           was compiled with. With latent series it also needs a plug-in
           column for each latent series, ahead of the observed ones, such as
           the posterior mean of `latent`.
-        - `error_dist=spec.resolved_error_dist`, as in the example. Under
-          Student-t errors, leaving it out makes `FittedVAR.from_posterior`
-          accept the posterior as Gaussian, so forecasts draw Gaussian
-          innovations.
+        - `error_dist=spec.resolved_error_dist`, as in the example in
+          `VAR.compile_for_numpyro`. Under Gaussian errors it makes no
+          difference. Under Student-t errors, leaving it out makes
+          `FittedVAR.from_posterior` accept the posterior as Gaussian, so
+          forecasts draw Gaussian innovations.
 
         Args:
             samples: NumPyro samples keyed by site name, each with a chain
@@ -379,9 +363,9 @@ class CompiledNumPyroBlock:
             container `FittedVAR.from_posterior` takes on each.
 
         Raises:
-            ValueError: If `samples` lacks a quantity the block records (as
-                when the block was called inside a `numpyro.handlers.scope`),
-                or a recorded quantity lacks its chain or draw axis (as from
+            ValueError: If `samples` lacks a recorded quantity (as when the
+                block was called inside a `numpyro.handlers.scope`), or a
+                recorded quantity lacks its chain or draw axis (as from
                 `mcmc.get_samples()` without `group_by_chain=True`).
             ValueError: If two variables in `samples` other than the block's
                 own sites would get the same name in the posterior once each
@@ -427,10 +411,19 @@ class CompiledNumPyroBlock:
         return make_idata(posterior=xr.Dataset(variables, coords=coords))
 
     def _intercept_of_every_equation(self, samples: Mapping[str, Any]) -> Any:
-        """The intercept samples of every equation, shape `(chain, draw, n_vars)`, as the posterior schema needs.
+        """The intercept samples of every equation, as the posterior schema needs.
 
         An equation that `intercept_equations` excluded has no recorded
         intercept, and its intercept is zero, as in the PyMC model's mean.
+
+        Args:
+            samples: NumPyro samples keyed by site name, as
+                `posterior_from_samples` takes them, with `B` and, unless
+                `intercept_equations` excluded every equation, `intercept`.
+
+        Returns:
+            The intercept samples, shape `(chain, draw, n_vars)`, with the
+            equations in `endog_names` order.
         """
         variable_names = self.coordinate_labels["var"]
         recorded_dims = self.dimension_names.get(INTERCEPT)

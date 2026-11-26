@@ -175,8 +175,8 @@ block = spec.compile_for_numpyro(exog=None, n_lags=1, endog_names=names, endog_s
 block.numpyro_site_names
 
 # %% [markdown]
-# The block declares one NumPyro sample site for each free variable of the PyMC model. Each
-# site holds its variable on PyMC's unconstrained scale: `sigma_sd_log__`, for example, is the
+# The block declares one NumPyro sample site for each PyMC value variable: the unconstrained
+# value of one free parameter of the PyMC model. `sigma_sd_log__`, for example, is the
 # logarithm of the innovation standard deviations. The sites have no NumPyro prior of their
 # own; the compiled log-density supplies the VAR's priors, its likelihood and PyMC's
 # corrections for the change of scale.
@@ -190,8 +190,8 @@ block.numpyro_site_names
 # 2. adds the VAR's log-density at the shift-free series to the model with `numpyro.factor`,
 #    and
 # 3. records the lag coefficients `B`, the `intercept` and the Cholesky factor `L` of the
-#    innovation covariance with `numpyro.deterministic`, under the names `VAR.fit` gives them
-#    (the **posterior schema**).
+#    innovation covariance, the **recorded quantities**, with `numpyro.deterministic`, under
+#    the names `VAR.fit` gives them (the **posterior schema**).
 #
 # It returns those values, so the rest of a NumPyro model can use them.
 
@@ -256,9 +256,9 @@ az.summary(posterior, var_names=["shift", "B", "intercept"])
 # forecasts and historical decompositions do, and they then describe the shift-free series,
 # not the observed series.
 #
-# Pass `error_dist=spec.resolved_error_dist` as well. It makes no difference for this VAR's
-# Gaussian errors, but under Student-t errors leaving it out makes `FittedVAR.from_posterior`
-# treat the posterior as Gaussian.
+# Pass `error_dist=spec.resolved_error_dist` as well; the docstring of
+# {py:meth}`CompiledNumPyroBlock.posterior_from_samples <impulso.numpyro_block.CompiledNumPyroBlock.posterior_from_samples>`
+# says why.
 
 # %%
 shift_mean = np.asarray(samples["shift"]).mean(axis=(0, 1))
@@ -311,9 +311,8 @@ for i in range(2):  # response
 # The block keeps the latent block of the lag coefficients stationary as PyMC does. With one
 # latent series and one lag, the latent series' own lag has a Normal prior truncated to
 # (−1, 1). In every other case the `latent_stationarity` Potential makes the log-density minus
-# infinity outside the stationary region. The Potential uses a non-symmetric
-# eigendecomposition, which JAX computes on a CPU and on a GPU (on a GPU it calls LAPACK on the
-# host CPU by default), and does not compute on a TPU.
+# infinity outside the stationary region. The Potential does not run on a TPU; the docstring of
+# {py:meth}`VAR.compile_for_numpyro <impulso.spec.VAR.compile_for_numpyro>` says why.
 #
 # ## What the compiled NumPyro block cannot do
 #

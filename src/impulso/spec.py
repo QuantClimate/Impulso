@@ -1483,47 +1483,57 @@ class VAR(ImpulsoBaseModel):
         `endog`: observed data, or an array the NumPyro model generated. Each
         call:
 
-        - declares one real-valued NumPyro sample site per free PyMC
-          variable. The site holds the variable on PyMC's unconstrained scale
-          (for example the log of a standard deviation) and has no NumPyro
-          prior of its own: its distribution is NumPyro's `ImproperUniform`
-          on the real line. The block's `numpyro_site_names` maps each PyMC
-          value-variable name to its site's name;
+        - declares one real-valued NumPyro sample site per PyMC value
+          variable: the unconstrained value of one free parameter of the PyMC
+          model, for example the log of a standard deviation. The site holds
+          that value and has no NumPyro prior of its own: its distribution is
+          NumPyro's `ImproperUniform` on the real line. The block's
+          `numpyro_site_names` maps each value variable's name to its site's
+          name;
         - adds the compiled log-density, priors and likelihood together, to
           the NumPyro model with `numpyro.factor`. It keeps PyMC's transform
           correction terms, so NumPyro's log-density of the model equals
           PyMC's log-density at the same parameter values;
-        - records `B`, `intercept`, `B_exog`, `L`, `nu` and `latent` with
-          `numpyro.deterministic`, under their unprefixed posterior-schema
-          names. A quantity the VAR does not have is not recorded: `intercept`
-          when `intercept_equations` is empty, `B_exog` when `exog` is `None`,
-          `nu` under Gaussian errors, and `latent` without latent series.
-          Under Student-t errors `nu` is recorded whether the degrees of
-          freedom are inferred or fixed, and `L` factors the scale matrix, not
-          the covariance (ADR-0007). With a strict-subset
-          `intercept_equations`, `intercept` covers only the included
-          equations, as PyMC's does;
+        - records `B`, `intercept`, `B_exog`, `L`, `nu` and `latent`, the
+          recorded quantities, with `numpyro.deterministic`, under their
+          unprefixed posterior-schema names. A quantity the VAR does not have
+          is not recorded: `intercept` when `intercept_equations` is empty,
+          `B_exog` when `exog` is `None`, `nu` under Gaussian errors, and
+          `latent` without latent series. Under Student-t errors `nu` is
+          recorded whether the degrees of freedom are inferred or fixed, and
+          `L` factors the scale matrix, not the covariance (ADR-0007). With a
+          strict-subset `intercept_equations`, `intercept` covers only the
+          included equations, as PyMC's does;
         - returns them as a `VARModelValues`, with `None` for each quantity
           not recorded, as `VARModelHandles` has, together with the latent
           series' names in the column order of `latent`.
 
-        For example::
+        The whole sequence, from compiling to impulse responses, for the
+        series in the `VARData` `data`::
 
-            block = VAR(lags=2).compile_for_numpyro(
-                exog=None, n_lags=2, endog_names=["gdp", "inflation"], endog_scales=impulso.ar1_residual_sd(endog)
+            spec = VAR(lags=2)
+            block = spec.compile_for_numpyro(
+                exog=None, n_lags=2, endog_names=data.endog_names, endog_scales=impulso.ar1_residual_sd(data.endog)
             )
 
             def model(endog):
                 values = block(endog)  # values.B, values.intercept, values.L
-                ...
+                ...  # the rest of the NumPyro model
 
-            mcmc = numpyro.infer.MCMC(numpyro.infer.NUTS(model), num_warmup=500, num_samples=500)
-            mcmc.run(jax.random.key(0), endog)
+            mcmc = numpyro.infer.MCMC(
+                numpyro.infer.NUTS(model), num_warmup=500, num_samples=500, num_chains=2, chain_method="sequential"
+            )
+            mcmc.run(jax.random.key(0), data.endog)
 
-        To compute impulse responses and forecasts from the samples, turn them
-        into a posterior with the block's `posterior_from_samples` and pass it
-        to `FittedVAR.from_posterior`. The docstring of
-        `CompiledNumPyroBlock.posterior_from_samples` shows the whole sequence.
+            posterior = block.posterior_from_samples(mcmc.get_samples(group_by_chain=True))
+            fitted = FittedVAR.from_posterior(posterior, data, n_lags=2, error_dist=spec.resolved_error_dist)
+            irf = fitted.set_identification_strategy(Cholesky(ordering=data.endog_names)).impulse_response()
+
+        `CompiledNumPyroBlock.posterior_from_samples` turns the samples into a
+        posterior for `FittedVAR.from_posterior`. Its docstring states the
+        two arguments of `FittedVAR.from_posterior` that are the caller's to
+        get right: the `VARData`, which with latent series needs a plug-in
+        column for each, and `error_dist`.
 
         The block's site names are not prefixed. To embed two VARs in one
         NumPyro model, call each block inside its own
@@ -1557,11 +1567,6 @@ class VAR(ImpulsoBaseModel):
         starts at the same point. Inside `numpyro.handlers.scope(prefix=...)`,
         prefix the keys the same way.
 
-        Handing the posterior to `FittedVAR`: `FittedVAR.from_posterior`
-        needs a `VARData`, and with latent series that `VARData` needs a
-        plug-in column for each latent series, such as its posterior-mean
-        path (ADR-0016).
-
         Limitations:
 
         - NumPyro cannot draw the VAR's parameters, because their sites have
@@ -1582,12 +1587,13 @@ class VAR(ImpulsoBaseModel):
           constant volatility; `endog_scales` is required; and latent series
           require Gaussian errors. This method raises them, with
           `build_in_model`'s messages, before compiling anything.
-        - Under JAX the latent-block stationarity constraint computes its
-          non-symmetric eigendecomposition on the CPU. JAX implements that
-          eigendecomposition only for CPU and GPU, and on a GPU it calls
-          LAPACK on the host CPU by default (see `jax.lax.linalg.eig`). On a
-          TPU it does not run. No GPU run has been tested. One latent series
-          with `n_lags=1` has no such constraint.
+        - The `latent_stationarity` Potential computes a non-symmetric
+          eigendecomposition, which JAX implements only for CPU and GPU (see
+          `jax.lax.linalg.eig`); on a GPU it calls LAPACK on the host CPU by
+          default. On a TPU the Potential does not run. No GPU run has been
+          tested. One latent series with `n_lags=1` computes no
+          eigendecomposition: its stationarity constraint is the truncated
+          own lag (ADR-0017).
 
         Importing PyTensor's JAX backend switches JAX to 64-bit floats
         (`jax_enable_x64`) when PyTensor's `floatX` is `float64`, its default.
