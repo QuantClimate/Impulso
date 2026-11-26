@@ -1511,18 +1511,18 @@ class VAR(ImpulsoBaseModel):
           not recorded, as `VARModelHandles` has, together with the latent
           series' names in the column order of `latent`.
 
-        ```python
-        block = VAR(lags=2).compile_for_numpyro(
-            exog=None, n_lags=2, endog_names=["gdp", "inflation"], endog_scales=impulso.ar1_residual_sd(endog)
-        )
+        For example::
 
-        def model(endog):
-            values = block(endog)  # values.B, values.intercept, values.L
-            ...
+            block = VAR(lags=2).compile_for_numpyro(
+                exog=None, n_lags=2, endog_names=["gdp", "inflation"], endog_scales=impulso.ar1_residual_sd(endog)
+            )
 
-        mcmc = numpyro.infer.MCMC(numpyro.infer.NUTS(model), num_warmup=500, num_samples=500)
-        mcmc.run(jax.random.key(0), endog)
-        ```
+            def model(endog):
+                values = block(endog)  # values.B, values.intercept, values.L
+                ...
+
+            mcmc = numpyro.infer.MCMC(numpyro.infer.NUTS(model), num_warmup=500, num_samples=500)
+            mcmc.run(jax.random.key(0), endog)
 
         To compute impulse responses and forecasts from the samples, turn them
         into a posterior with the block's `posterior_from_samples` and pass it
