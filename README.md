@@ -40,7 +40,7 @@ VARData → VAR.fit() → FittedVAR → .set_identification_strategy() → Ident
 - **Forecast error variance decomposition** (FEVD)
 - **Historical decomposition** of variables into structural shocks
 - **Dynamic multipliers**: Response of endogenous variables to exogenous (VARX) drivers
-- **Embeddable VARs**: Build a VAR inside an existing PyMC model with `VAR.build_in_model`, with symbolic observed data or latent endogenous series generated in the model under a stationarity constraint, then wrap the posterior with `FittedVAR.from_posterior` (see ADR-0016)
+- **Embeddable VARs**: Build a VAR inside an existing PyMC model with `VAR.build_in_model`, with symbolic observed data or latent endogenous series generated in the model under a stationarity constraint, then wrap the posterior with `FittedVAR.from_posterior` (see ADR-0016). `VAR.compile_for_numpyro` compiles the same VAR for use inside a NumPyro model (see ADR-0018)
 - **Extensible protocols**: Plug in custom priors, samplers, and identification schemes
 - **Type-safe**: Frozen Pydantic models with full type hints
 
@@ -78,6 +78,22 @@ from impulso.samplers import NUTSSampler
 sampler = NUTSSampler(nuts_sampler="nutpie")   # or "pymc"
 fitted = var.fit(data, sampler=sampler)
 ```
+
+### A VAR inside a NumPyro model
+
+`VAR.compile_for_numpyro` compiles a VAR's PyMC model to JAX so that a [NumPyro](https://num.pyro.ai/) model can call it. It needs JAX and NumPyro, in the optional `numpyro` extra:
+
+```bash
+pip install "impulso[numpyro]"
+```
+
+Or with uv:
+
+```bash
+uv add impulso --extra numpyro
+```
+
+The tutorial [A VAR Inside a NumPyro Model](https://impulso.quantclimate.com/tutorials/var-in-numpyro.html) walks through compiling, sampling with NumPyro's NUTS and handing the posterior to `FittedVAR`.
 
 ## Quick Start
 
