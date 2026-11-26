@@ -13,6 +13,7 @@ from impulso._base import ImpulsoBaseModel
 from impulso._design import build_lag_design_matrix
 from impulso._optional import require_all
 from impulso._posterior import COEFFICIENTS, EXOG_COEFFICIENTS, INTERCEPT
+from impulso._zero_gradient import declare_zero_gradient, has_zero_gradient, zero_gradient_op
 from impulso.data import VARData, _format_names
 from impulso.observation import Gaussian, StudentT
 from impulso.priors import MinnesotaPrior
@@ -494,24 +495,16 @@ def _register_latent_stationarity(B: Any, n_latent: int, n_vars: int, n_lags: in
     matrix. The observed series are data, so only this block decides whether
     the generated path explodes.
     """
-    import inspect
-
     import pymc as pm
     import pytensor.tensor as pt
-    from pytensor.compile.builders import OpFromGraph
 
     # The Potential is piecewise constant in `B`, so its gradient is zero.
     # PyTensor cannot differentiate the complex `eig`, and PyMC's graph
     # rewrites strip `disconnected_grad`, so the radius is wrapped in an
     # `OpFromGraph` whose gradient is overridden with zeros.
-    # Newer PyTensor renamed `lop_overrides` to `pullback`.
-    override = "pullback" if "pullback" in inspect.signature(OpFromGraph.__init__).parameters else "lop_overrides"
     companion = pt.matrix("companion")
-    spectral_radius = OpFromGraph(
-        [companion],
-        [pt.max(pt.abs(pt.linalg.eig(companion)[0]))],
-        name="spectral_radius",
-        **{override: lambda inputs, outputs, output_grads: [pt.zeros_like(inputs[0])]},
+    spectral_radius = zero_gradient_op(
+        [companion], [pt.max(pt.abs(pt.linalg.eig(companion)[0]))], name="spectral_radius"
     )
     # `eig` raises on a non-finite matrix, which would abort the sampler
     # instead of recording a divergence. Swap such a matrix for an
@@ -520,7 +513,10 @@ def _register_latent_stationarity(B: Any, n_latent: int, n_vars: int, n_lags: in
     size = n_latent * n_lags
     matrix = pt.switch(pt.all(~(pt.isnan(matrix) | pt.isinf(matrix))), matrix, 2.0 * pt.eye(size))
     radius = spectral_radius(matrix)
-    pm.Potential(_LATENT_STATIONARITY, pt.switch(pt.lt(radius, 1.0), np.float64(0.0), np.float64(-np.inf)))
+    # Declared, because PyTensor's JAX conversion drops the override (ADR-0018).
+    declare_zero_gradient(
+        pm.Potential(_LATENT_STATIONARITY, pt.switch(pt.lt(radius, 1.0), np.float64(0.0), np.float64(-np.inf)))
+    )
 
 
 def _scan(fn: Any, **kwargs: Any) -> "pt.TensorVariable":
@@ -1668,18 +1664,19 @@ class VAR(ImpulsoBaseModel):
 
         inputs = [*model.value_vars, endog]
         # The log-density sums the priors, the Potentials (the likelihood
-        # `obs` among them) and the transforms' correction terms. The
-        # `latent_stationarity` Potential is 0 inside the stationary region
-        # and -inf outside, so its gradient is zero; PyMC gets that zero from
-        # a gradient override. PyTensor's JAX conversion inlines the override,
-        # and JAX cannot differentiate the eigendecomposition inside it, so
-        # the Potential is compiled on its own and added with a zero gradient.
-        stationarity = [potential for potential in model.potentials if potential.name == _LATENT_STATIONARITY]
-        rest = [*model.basic_RVs, *(potential for potential in model.potentials if potential not in stationarity)]
-        log_density = get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=rest)])
-        if stationarity:
+        # `obs` among them) and the transforms' correction terms. PyMC gives a
+        # term declared with `declare_zero_gradient`, such as the
+        # `latent_stationarity` Potential, a zero gradient through a gradient
+        # override. PyTensor's JAX conversion drops the override, so the
+        # declared terms are compiled on their own and added with a zero
+        # gradient.
+        terms = [*model.basic_RVs, *model.potentials]
+        zero_gradient_terms = [term for term in terms if has_zero_gradient(term)]
+        differentiated_terms = [term for term in terms if not has_zero_gradient(term)]
+        log_density = get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=differentiated_terms)])
+        if zero_gradient_terms:
             log_density = add_with_zero_gradient(
-                log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=stationarity)])
+                log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=zero_gradient_terms)])
             )
         # The posterior schema reads `nu` exactly when the error distribution
         # is heavy-tailed. The Student-t adapter registers it as the

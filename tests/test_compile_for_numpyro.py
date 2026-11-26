@@ -325,6 +325,49 @@ def test_log_density_gradient_is_finite_and_equals_pymc_at_the_pymc_initial_poin
     np.testing.assert_allclose(np.concatenate(numpyro_gradient), pymc_gradient, rtol=1e-6, atol=1e-9)
 
 
+def test_every_term_declared_with_a_zero_gradient_is_passed_no_gradient(rng, monkeypatch):
+    """PyMC gives a term declared with `declare_zero_gradient` a zero gradient through its override, which
+    PyTensor's JAX conversion drops. Beside the `latent_stationarity` Potential, `build_in_model` here registers a
+    second declared term: the sum of `B`, whose gradient is overridden with zeros, so without its override JAX
+    would differentiate it to 1 in every entry of `B`. The compile step passes every declared term no gradient:
+    NumPyro's log-density and its gradient equal PyMC's."""
+    _require_numpyro()
+    import jax
+    import pymc as pm
+    import pytensor.tensor as pt
+    from numpyro.infer.util import log_density
+
+    from impulso._zero_gradient import declare_zero_gradient, zero_gradient_op
+
+    original_build = VAR.build_in_model
+
+    def build_with_a_second_zero_gradient_term(self, *args, **build_kwargs):
+        handles = original_build(self, *args, **build_kwargs)
+        coefficients = pt.matrix("coefficients")
+        sum_without_gradient = zero_gradient_op([coefficients], [pt.sum(coefficients)], name="sum_without_gradient")
+        declare_zero_gradient(pm.Potential("sum_of_B_without_gradient", sum_without_gradient(handles.B)))
+        return handles
+
+    monkeypatch.setattr(VAR, "build_in_model", build_with_a_second_zero_gradient_term)
+    endog = rng.standard_normal((N_ROWS, 2))
+    kwargs = _build_kwargs(endog, 2, n_latent=2)
+    spec = VAR(lags=2)
+    model = _pymc_model(spec, endog, kwargs)
+    initial_point = model.initial_point()
+    block = _compile(spec, endog, kwargs)
+    params = _numpyro_params(block, initial_point)
+
+    def joint(params):
+        return log_density(_observed_endog_model(block), (endog,), {}, params)[0]
+
+    gradient = jax.grad(joint)(params)
+
+    assert float(joint(params)) == pytest.approx(float(model.compile_logp()(initial_point)), rel=1e-9)
+    pymc_gradient = model.compile_dlogp(vars=model.free_RVs)(initial_point)
+    numpyro_gradient = [np.ravel(gradient[block.numpyro_site_names[value.name]]) for value in model.value_vars]
+    np.testing.assert_allclose(np.concatenate(numpyro_gradient), pymc_gradient, rtol=1e-6, atol=1e-9)
+
+
 @pytest.mark.parametrize("variant", MODEL_VARIANTS)
 def test_initial_point_starts_numpyro_at_the_pymc_initial_point(rng, variant):
     """`init_to_value` with the block's initial point starts NumPyro at PyMC's initial point, where the log-density
