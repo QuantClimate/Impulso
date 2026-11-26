@@ -42,7 +42,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from impulso._posterior import COEFFICIENTS, EXOG_COEFFICIENTS, INTERCEPT
+from impulso._posterior import CHOLESKY_FACTOR, COEFFICIENTS, DEGREES_OF_FREEDOM, EXOG_COEFFICIENTS, INTERCEPT
 from impulso.conjugate_volatility import ConjugateVolatility
 from impulso.sv.spec import StochasticVolatility
 from impulso.volatility import Constant
@@ -53,10 +53,8 @@ if TYPE_CHECKING:
     from impulso.data import VARData
     from impulso.protocols import ErrorDistribution, VolatilityProcess
 
-_CHOLESKY = "L"
 _LOG_VOLATILITY = "h"
 _MIXING_CHOLESKY = "R_chol"
-_DEGREES_OF_FREEDOM = "nu"
 
 
 def _require_variable(
@@ -211,11 +209,11 @@ def _validate_constant_cholesky(posterior: xr.Dataset, n_vars: int) -> None:
     share dim names.
     """
     layout = (
-        f"'{_CHOLESKY}' must have 4 dims including 'chain' and 'draw', with the remaining two "
+        f"'{CHOLESKY_FACTOR}' must have 4 dims including 'chain' and 'draw', with the remaining two "
         f"axes both of size {n_vars} — the lower-triangular Cholesky factor of Sigma that "
         "`Constant.cholesky_at` reads directly from the posterior."
     )
-    _require_shape_only(posterior, _CHOLESKY, [n_vars, n_vars], layout)
+    _require_shape_only(posterior, CHOLESKY_FACTOR, [n_vars, n_vars], layout)
 
 
 def _validate_stochastic_volatility(posterior: xr.Dataset, n_vars: int, expected_t: int) -> None:
@@ -283,7 +281,7 @@ def _validate_volatility(posterior: xr.Dataset, data: VARData, n_lags: int, vola
         raise TypeError(
             f"FittedVAR.from_posterior: unrecognised volatility adapter {type(volatility).__name__!r}. "
             f"Schema validation knows how to check a Constant or ConjugateVolatility posterior "
-            f"(a Cholesky factor {_CHOLESKY!r}) and a StochasticVolatility posterior "
+            f"(a Cholesky factor {CHOLESKY_FACTOR!r}) and a StochasticVolatility posterior "
             f"({_LOG_VOLATILITY!r} and {_MIXING_CHOLESKY!r}); pass one of those as `volatility`, or "
             "extend impulso._posterior_validation to recognise a new adapter."
         )
@@ -317,11 +315,11 @@ def _validate_degrees_of_freedom(posterior: xr.Dataset, error_dist: ErrorDistrib
         return
     _require_variable(
         posterior,
-        _DEGREES_OF_FREEDOM,
+        DEGREES_OF_FREEDOM,
         expected_dims=("chain", "draw"),
         sizes={},
         layout=(
-            f"'{_DEGREES_OF_FREEDOM}' must have dims (chain, draw); required because error_dist "
+            f"'{DEGREES_OF_FREEDOM}' must have dims (chain, draw); required because error_dist "
             f"{type(error_dist).__name__} is heavy-tailed."
         ),
     )

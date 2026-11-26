@@ -82,6 +82,9 @@ dev = [
 ]
 docs = [
     "statsmodels>=0.14.6",
+    # The NumPyro tutorial compiles a VAR to JAX and samples it with NumPyro.
+    "jax>=0.7.0",
+    "numpyro>=0.20",
     "qc-core>=0.0.1",
     "sphinx>=8.1",
     "myst-nb>=1.2",
@@ -221,7 +224,6 @@ ignore_names = [
     "__getattr__",    # PEP 562 lazy exports in impulso/__init__.py
     "__dir__",        # PEP 562 dir() for lazy exports
     "writeable",      # ndarray.flags.writeable = False (array freeze)
-    "output_grads",   # PyTensor OpFromGraph pullback/lop_overrides callback signature
 ]
 
 [tool.jupytext]

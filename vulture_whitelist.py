@@ -37,6 +37,9 @@ _.historical_decomposition
 _.counterfactual
 _.structural_scenario
 
+# impulso.numpyro_block.CompiledNumPyroBlock
+_.posterior_from_samples
+
 # impulso.results
 _.difference
 _.summary
@@ -48,6 +51,7 @@ _.rank
 
 # impulso.spec.VAR
 _.prior_predictive
+_.compile_for_numpyro
 
 # impulso.sv.fitted.FittedSV
 _.log_volatility

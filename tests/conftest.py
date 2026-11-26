@@ -1,10 +1,13 @@
 """Shared test fixtures for Impulso."""
 
+from collections.abc import Sequence
+
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 
+from impulso import ar1_residual_sd
 from impulso._arviz_compat import get_group_dataset, make_idata
 from impulso.data import VARData
 
@@ -326,3 +329,98 @@ def synthetic_sv_idata_2v():
         "v1_sigma_eta": (("chain", "draw"), np.abs(rng.standard_normal((n_chains, n_draws)))),
     })
     return make_idata(posterior=posterior)
+
+
+# --------------- VAR compiled for NumPyro ---------------
+
+
+@pytest.fixture
+def numpyro():
+    """The `numpyro` module. Skips the test unless JAX and NumPyro are installed."""
+    pytest.importorskip("jax")
+    return pytest.importorskip("numpyro")
+
+
+@pytest.fixture
+def two_series_endog(rng):
+    """Endogenous data of the two observed series `y1` and `y2`: 40 standard-normal rows, drawn from `rng`."""
+    return rng.standard_normal((40, 2))
+
+
+@pytest.fixture
+def build_in_model_arguments():
+    """A function giving `VAR.build_in_model`'s arguments other than `endog`, for a VAR on `y1` and `y2`.
+
+    The function takes `endog`, the two observed columns, and `n_lags`, and
+    the keyword options:
+
+    - `n_latent`: latent series `b0, b1, ...` ahead of `y1` and `y2`, each
+      with scale 1.
+    - `exogenous_regressors`: two regressors `x1` and `x2` with standard
+      deviations 0.5 and 3, so the exogenous prior's scaling by each
+      regressor's standard deviation (ADR-0012) matters. Every call draws the
+      same values.
+    - `intercept_equations`, passed on as it is.
+
+    `VAR.compile_for_numpyro` takes the same arguments.
+    """
+
+    def arguments(
+        endog: np.ndarray,
+        n_lags: int,
+        *,
+        n_latent: int = 0,
+        exogenous_regressors: bool = False,
+        intercept_equations: Sequence[str] | None = None,
+    ) -> dict:
+        latent_names = [f"b{i}" for i in range(n_latent)]
+        kwargs = {
+            "exog": None,
+            "n_lags": n_lags,
+            "endog_names": [*latent_names, "y1", "y2"],
+            "endog_scales": np.concatenate([np.ones(n_latent), ar1_residual_sd(endog)]),
+        }
+        if latent_names:
+            kwargs["latent_names"] = latent_names
+        if exogenous_regressors:
+            exog_rng = np.random.default_rng(7)
+            kwargs["exog"] = exog_rng.standard_normal((endog.shape[0], 2)) * np.array([0.5, 3.0])
+            kwargs["exog_names"] = ["x1", "x2"]
+        if intercept_equations is not None:
+            kwargs["intercept_equations"] = list(intercept_equations)
+        return kwargs
+
+    return arguments
+
+
+@pytest.fixture
+def build_pymc_model():
+    """A function that builds a VAR in PyMC with `build_in_model` and returns the `pymc.Model`.
+
+    It takes the `VAR`, `endog` and `build_in_model`'s other arguments, and
+    gives `build_in_model` a symbolic tensor holding `endog`.
+    """
+
+    def build(spec, endog: np.ndarray, kwargs: dict):
+        import pymc as pm
+        import pytensor
+
+        with pm.Model() as model:
+            spec.build_in_model(endog=pytensor.shared(endog), **kwargs)
+        return model
+
+    return build
+
+
+@pytest.fixture
+def observed_endog_model():
+    """A function from a compiled NumPyro block to a NumPyro model function that passes observed data to the
+    block as `endog`."""
+
+    def numpyro_model_for(block):
+        def model(endog):
+            return block(endog)
+
+        return model
+
+    return numpyro_model_for
