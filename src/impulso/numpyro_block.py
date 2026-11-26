@@ -190,27 +190,25 @@ class CompiledNumPyroBlock:
         checks `B`, `intercept` and `B_exog` by dimension name. This method
         names the sample axes `chain` and `draw` and gives each quantity the
         block records its `dimension_names` and `coordinate_labels`. The
-        whole sequence, from compiling to impulse responses:
+        whole sequence, from compiling to impulse responses::
 
-        ```python
-        spec = VAR(lags=2)
-        block = spec.compile_for_numpyro(
-            exog=None, n_lags=2, endog_names=data.endog_names, endog_scales=impulso.ar1_residual_sd(data.endog)
-        )
+            spec = VAR(lags=2)
+            block = spec.compile_for_numpyro(
+                exog=None, n_lags=2, endog_names=data.endog_names, endog_scales=impulso.ar1_residual_sd(data.endog)
+            )
 
-        def model(endog):
-            values = block(endog)  # values.B, values.intercept, values.L
-            ...  # the rest of the NumPyro model
+            def model(endog):
+                values = block(endog)  # values.B, values.intercept, values.L
+                ...  # the rest of the NumPyro model
 
-        mcmc = numpyro.infer.MCMC(
-            numpyro.infer.NUTS(model), num_warmup=500, num_samples=500, num_chains=2, chain_method="sequential"
-        )
-        mcmc.run(jax.random.key(0), data.endog)
+            mcmc = numpyro.infer.MCMC(
+                numpyro.infer.NUTS(model), num_warmup=500, num_samples=500, num_chains=2, chain_method="sequential"
+            )
+            mcmc.run(jax.random.key(0), data.endog)
 
-        posterior = block.posterior_from_samples(mcmc.get_samples(group_by_chain=True))
-        fitted = FittedVAR.from_posterior(posterior, data, n_lags=2, error_dist=spec.resolved_error_dist)
-        irf = fitted.set_identification_strategy(Cholesky(ordering=data.endog_names)).impulse_response()
-        ```
+            posterior = block.posterior_from_samples(mcmc.get_samples(group_by_chain=True))
+            fitted = FittedVAR.from_posterior(posterior, data, n_lags=2, error_dist=spec.resolved_error_dist)
+            irf = fitted.set_identification_strategy(Cholesky(ordering=data.endog_names)).impulse_response()
 
         The posterior holds:
 
@@ -219,9 +217,14 @@ class CompiledNumPyroBlock:
           equation that `intercept_equations` excluded gets zero, as in the
           PyMC model's mean;
         - every other variable in `samples`, such as the NumPyro model's own
-          sample and deterministic sites, under its own name, with PyMC's
-          default dimension names `{name}_dim_0`, `{name}_dim_1`, and so on.
-          `FittedVAR.from_posterior` reads none of them.
+          sample and deterministic sites, under its own name with each `/`
+          replaced by `.`, and with PyMC's default dimension names built from
+          that name: `{name}_dim_0`, `{name}_dim_1`, and so on. ArviZ 1
+          refuses `/` in a variable name, and
+          `numpyro.handlers.scope(prefix="user")` names a site `user/scale`.
+          The posterior holds that site as `user.scale` under ArviZ 0 as
+          well, so the names are the same under both.
+          `FittedVAR.from_posterior` reads none of these variables.
 
         It leaves out the block's own sites: the sample sites in
         `numpyro_site_names`, which hold the VAR's parameters on PyMC's
@@ -256,6 +259,9 @@ class CompiledNumPyroBlock:
                 when the block was called inside a `numpyro.handlers.scope`),
                 or a recorded quantity lacks its chain or draw axis (as from
                 `mcmc.get_samples()` without `group_by_chain=True`).
+            ValueError: If two variables in `samples` other than the block's
+                own sites would get the same name in the posterior once each
+                `/` is replaced by `.`, such as `user/scale` and `user.scale`.
         """
         import numpy as np
         import xarray as xr
@@ -277,12 +283,21 @@ class CompiledNumPyroBlock:
                 )
         block_sites = {*self.numpyro_site_names.values(), LOG_DENSITY_SITE}
         variables = {}
+        site_of_posterior_name: dict[str, str] = {}
         for name, value in samples.items():
             if name in block_sites:
                 continue
+            posterior_name = name.replace("/", ".")
+            if posterior_name in site_of_posterior_name:
+                first, second = sorted((site_of_posterior_name[posterior_name], name))
+                raise ValueError(
+                    f"The samples hold {first!r} and {second!r}, which would both be {posterior_name!r} in the "
+                    "posterior, where each `/` in a site's name becomes `.`. Rename one of the two sites."
+                )
+            site_of_posterior_name[posterior_name] = name
             array = np.asarray(value)
-            dims = self.dimension_names.get(name, tuple(f"{name}_dim_{i}" for i in range(array.ndim - 2)))
-            variables[name] = (("chain", "draw", *dims), array)
+            dims = self.dimension_names.get(name, tuple(f"{posterior_name}_dim_{i}" for i in range(array.ndim - 2)))
+            variables[posterior_name] = (("chain", "draw", *dims), array)
         variables[INTERCEPT] = (("chain", "draw", "var"), self._intercept_of_every_equation(samples))
         used_dims = {dim for dims, _ in variables.values() for dim in dims}
         coords = {dim: list(labels) for dim, labels in self.coordinate_labels.items() if dim in used_dims}

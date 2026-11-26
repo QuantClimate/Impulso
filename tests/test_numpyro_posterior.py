@@ -219,6 +219,65 @@ def test_variables_of_the_users_own_model_are_kept_and_accepted(rng):
     assert not {*block.numpyro_site_names.values(), LOG_DENSITY_SITE} & set(posterior.data_vars)
 
 
+def test_users_own_scoped_sites_are_accepted_with_each_slash_replaced_by_a_dot(rng):
+    """`numpyro.handlers.scope` names each site it prefixes `{prefix}/{name}`, and ArviZ 1 refuses `/` in a
+    variable name. The posterior holds such a site under its name with each `/` replaced by `.`, on every ArviZ
+    version, so the names do not depend on which one is installed."""
+    numpyro = _require_numpyro()
+    import numpyro.distributions as dist
+    from numpyro import handlers
+
+    endog = rng.standard_normal((N_ROWS, 2))
+    kwargs = _build_kwargs(endog, 1)
+    spec = VAR(lags=1)
+    draws = _parameter_draws(_pymc_model(spec, endog, kwargs), rng)
+    block = spec.compile_for_numpyro(**kwargs)
+
+    def numpyro_model(endog):
+        values = block(endog)
+        with handlers.scope(prefix="user"):
+            scale = numpyro.sample("scale", dist.HalfNormal(1.0))
+            numpyro.deterministic("fitted", scale * endog[:, 0])
+        return values
+
+    samples = _numpyro_samples(block, numpyro_model, endog, draws)
+    assert {"user/scale", "user/fitted"} <= set(samples)
+
+    fitted = FittedVAR.from_posterior(block.posterior_from_samples(samples), _var_data(endog), n_lags=1)
+
+    posterior = posterior_dataset(fitted.idata)
+    assert posterior["user.scale"].dims == ("chain", "draw")
+    assert posterior["user.fitted"].dims == ("chain", "draw", "user.fitted_dim_0")
+    np.testing.assert_array_equal(posterior["user.scale"].values, samples["user/scale"])
+    np.testing.assert_array_equal(posterior["user.fitted"].values, samples["user/fitted"])
+
+
+def test_users_own_sites_that_get_the_same_posterior_name_are_refused(rng):
+    """`user/scale` and `user.scale` would both be `user.scale` in the posterior, so the helper refuses them, naming
+    both, instead of dropping one."""
+    numpyro = _require_numpyro()
+    import numpyro.distributions as dist
+    from numpyro import handlers
+
+    endog = rng.standard_normal((N_ROWS, 2))
+    kwargs = _build_kwargs(endog, 1)
+    spec = VAR(lags=1)
+    draws = _parameter_draws(_pymc_model(spec, endog, kwargs), rng)
+    block = spec.compile_for_numpyro(**kwargs)
+
+    def numpyro_model(endog):
+        values = block(endog)
+        numpyro.sample("user.scale", dist.HalfNormal(1.0))
+        with handlers.scope(prefix="user"):
+            numpyro.sample("scale", dist.HalfNormal(1.0))
+        return values
+
+    samples = _numpyro_samples(block, numpyro_model, endog, draws)
+
+    with pytest.raises(ValueError, match=r"'user\.scale' and 'user/scale', which would both be 'user\.scale'"):
+        block.posterior_from_samples(samples)
+
+
 def _merge_chains(samples: dict) -> dict:
     """What `MCMC.get_samples()` returns without `group_by_chain=True`: the chains merged into one axis."""
     return {name: value.reshape(N_CHAINS * N_DRAWS, *value.shape[2:]) for name, value in samples.items()}

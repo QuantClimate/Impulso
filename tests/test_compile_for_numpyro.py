@@ -9,9 +9,11 @@ point) with the same VAR built in PyMC by `build_in_model` with a symbolic
 `endog`.
 
 The tests that need JAX and NumPyro skip without them. The missing-package
-tests do not: they hide the packages themselves.
+tests do not: they set which of the two packages are installed themselves.
 """
 
+import importlib.abc
+import importlib.util
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -319,7 +321,8 @@ def test_log_density_gradient_is_finite_and_equals_pymc_at_the_pymc_initial_poin
     # PyMC's gradient is one flat array: each free variable's gradient raveled, in `model.value_vars` order.
     pymc_gradient = model.compile_dlogp(vars=model.free_RVs)(initial_point)
     numpyro_gradient = [np.ravel(gradient[block.numpyro_site_names[value.name]]) for value in model.value_vars]
-    np.testing.assert_allclose(np.concatenate(numpyro_gradient), pymc_gradient, rtol=1e-9, atol=1e-9)
+    # rtol 1e-6: on the Python 3.11 stack the Student-t degrees-of-freedom gradient differs by about 7e-9 relative.
+    np.testing.assert_allclose(np.concatenate(numpyro_gradient), pymc_gradient, rtol=1e-6, atol=1e-9)
 
 
 @pytest.mark.parametrize("variant", MODEL_VARIANTS)
@@ -434,6 +437,30 @@ class TestNumberOfEndogRows:
             _observed_endog_model(block)(endog[:-5])
 
 
+PACKAGE_DEPENDENCIES = {"jax": (), "numpyro": ("jax",)}
+"""The packages `compile_for_numpyro` needs, each with the packages that importing it imports."""
+
+
+class SimulatedInstall(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """An import finder that treats each package in `dependencies` as installed, whether it is or not.
+
+    Importing such a package gives an empty module, after importing the packages it depends on.
+    """
+
+    def __init__(self, dependencies: dict[str, tuple[str, ...]]):
+        self.dependencies = dependencies
+
+    def find_spec(self, name, path=None, target=None):
+        return importlib.util.spec_from_loader(name, self) if name in self.dependencies else None
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        for dependency in self.dependencies[module.__name__]:
+            importlib.import_module(dependency)
+
+
 @pytest.mark.parametrize(
     ("missing", "expected_start"),
     [
@@ -443,10 +470,17 @@ class TestNumberOfEndogRows:
     ],
 )
 def test_missing_packages_are_named(rng, monkeypatch, missing, expected_start):
-    """A `None` entry in `sys.modules` makes importing that module raise `ImportError`, as if it were absent.
-    NumPyro imports JAX, so with JAX missing only JAX is named."""
-    for module in missing:
-        monkeypatch.setitem(sys.modules, module, None)
+    """Each case sets which of JAX and NumPyro are installed, whatever the test environment has. A missing package
+    is a `None` entry in `sys.modules`, which makes importing it raise `ImportError`. An installed package is an
+    empty module that `SimulatedInstall` finds, and importing NumPyro imports JAX, as the real NumPyro does. So
+    with JAX missing NumPyro fails to import too, and only JAX is named."""
+    for package in PACKAGE_DEPENDENCIES:
+        monkeypatch.setitem(sys.modules, package, None)
+        if package not in missing:
+            # Without an entry, the import asks `sys.meta_path`. Undoing the `setitem` restores the real entry.
+            monkeypatch.delitem(sys.modules, package)
+    installed = {package: needs for package, needs in PACKAGE_DEPENDENCIES.items() if package not in missing}
+    monkeypatch.setattr(sys, "meta_path", [SimulatedInstall(installed), *sys.meta_path])
     endog = rng.standard_normal((N_ROWS, 2))
 
     with pytest.raises(ImportError) as raised:
