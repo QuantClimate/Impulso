@@ -12,7 +12,8 @@ from impulso._arviz_compat import InferenceDataLike
 from impulso._base import ImpulsoBaseModel
 from impulso._design import build_lag_design_matrix
 from impulso._optional import require_all
-from impulso._posterior import COEFFICIENTS, EXOG_COEFFICIENTS, INTERCEPT
+from impulso._posterior import COEFFICIENTS, DEGREES_OF_FREEDOM, EXOG_COEFFICIENTS, INTERCEPT, LATENT_PATHS
+from impulso._zero_gradient import declare_zero_gradient, zero_gradient_op
 from impulso.data import VARData, _format_names
 from impulso.observation import Gaussian, StudentT
 from impulso.priors import MinnesotaPrior
@@ -494,24 +495,16 @@ def _register_latent_stationarity(B: Any, n_latent: int, n_vars: int, n_lags: in
     matrix. The observed series are data, so only this block decides whether
     the generated path explodes.
     """
-    import inspect
-
     import pymc as pm
     import pytensor.tensor as pt
-    from pytensor.compile.builders import OpFromGraph
 
     # The Potential is piecewise constant in `B`, so its gradient is zero.
     # PyTensor cannot differentiate the complex `eig`, and PyMC's graph
     # rewrites strip `disconnected_grad`, so the radius is wrapped in an
     # `OpFromGraph` whose gradient is overridden with zeros.
-    # Newer PyTensor renamed `lop_overrides` to `pullback`.
-    override = "pullback" if "pullback" in inspect.signature(OpFromGraph.__init__).parameters else "lop_overrides"
     companion = pt.matrix("companion")
-    spectral_radius = OpFromGraph(
-        [companion],
-        [pt.max(pt.abs(pt.linalg.eig(companion)[0]))],
-        name="spectral_radius",
-        **{override: lambda inputs, outputs, output_grads: [pt.zeros_like(inputs[0])]},
+    spectral_radius = zero_gradient_op(
+        [companion], [pt.max(pt.abs(pt.linalg.eig(companion)[0]))], name="spectral_radius"
     )
     # `eig` raises on a non-finite matrix, which would abort the sampler
     # instead of recording a divergence. Swap such a matrix for an
@@ -520,7 +513,10 @@ def _register_latent_stationarity(B: Any, n_latent: int, n_vars: int, n_lags: in
     size = n_latent * n_lags
     matrix = pt.switch(pt.all(~(pt.isnan(matrix) | pt.isinf(matrix))), matrix, 2.0 * pt.eye(size))
     radius = spectral_radius(matrix)
-    pm.Potential(_LATENT_STATIONARITY, pt.switch(pt.lt(radius, 1.0), np.float64(0.0), np.float64(-np.inf)))
+    # Declared, because PyTensor's JAX conversion drops the override (ADR-0018).
+    declare_zero_gradient(
+        pm.Potential(_LATENT_STATIONARITY, pt.switch(pt.lt(radius, 1.0), np.float64(0.0), np.float64(-np.inf)))
+    )
 
 
 def _scan(fn: Any, **kwargs: Any) -> "pt.TensorVariable":
@@ -611,7 +607,7 @@ def _latent_path(
         outputs_info=[{"initial": initial, "taps": list(range(-n_lags, 0))}],
         non_sequences=[A_lat],
     )
-    path = pm.Deterministic("latent", pt.concatenate([init, history], axis=0))
+    path = pm.Deterministic(LATENT_PATHS, pt.concatenate([init, history], axis=0))
     return path, z
 
 
@@ -1487,47 +1483,57 @@ class VAR(ImpulsoBaseModel):
         `endog`: observed data, or an array the NumPyro model generated. Each
         call:
 
-        - declares one real-valued NumPyro sample site per free PyMC
-          variable. The site holds the variable on PyMC's unconstrained scale
-          (for example the log of a standard deviation) and has no NumPyro
-          prior of its own: its distribution is NumPyro's `ImproperUniform`
-          on the real line. The block's `numpyro_site_names` maps each PyMC
-          value-variable name to its site's name;
+        - declares one real-valued NumPyro sample site per PyMC value
+          variable: the unconstrained value of one free parameter of the PyMC
+          model, for example the log of a standard deviation. The site holds
+          that value and has no NumPyro prior of its own: its distribution is
+          NumPyro's `ImproperUniform` on the real line. The block's
+          `numpyro_site_names` maps each value variable's name to its site's
+          name;
         - adds the compiled log-density, priors and likelihood together, to
           the NumPyro model with `numpyro.factor`. It keeps PyMC's transform
           correction terms, so NumPyro's log-density of the model equals
           PyMC's log-density at the same parameter values;
-        - records `B`, `intercept`, `B_exog`, `L`, `nu` and `latent` with
-          `numpyro.deterministic`, under their unprefixed posterior-schema
-          names. A quantity the VAR does not have is not recorded: `intercept`
-          when `intercept_equations` is empty, `B_exog` when `exog` is `None`,
-          `nu` under Gaussian errors, and `latent` without latent series.
-          Under Student-t errors `nu` is recorded whether the degrees of
-          freedom are inferred or fixed, and `L` factors the scale matrix, not
-          the covariance (ADR-0007). With a strict-subset
-          `intercept_equations`, `intercept` covers only the included
-          equations, as PyMC's does;
+        - records `B`, `intercept`, `B_exog`, `L`, `nu` and `latent`, the
+          recorded quantities, with `numpyro.deterministic`, under their
+          unprefixed posterior-schema names. A quantity the VAR does not have
+          is not recorded: `intercept` when `intercept_equations` is empty,
+          `B_exog` when `exog` is `None`, `nu` under Gaussian errors, and
+          `latent` without latent series. Under Student-t errors `nu` is
+          recorded whether the degrees of freedom are inferred or fixed, and
+          `L` factors the scale matrix, not the covariance (ADR-0007). With a
+          strict-subset `intercept_equations`, `intercept` covers only the
+          included equations, as PyMC's does;
         - returns them as a `VARModelValues`, with `None` for each quantity
           not recorded, as `VARModelHandles` has, together with the latent
           series' names in the column order of `latent`.
 
-        For example::
+        The whole sequence, from compiling to impulse responses, for the
+        series in the `VARData` `data`::
 
-            block = VAR(lags=2).compile_for_numpyro(
-                exog=None, n_lags=2, endog_names=["gdp", "inflation"], endog_scales=impulso.ar1_residual_sd(endog)
+            spec = VAR(lags=2)
+            block = spec.compile_for_numpyro(
+                exog=None, n_lags=2, endog_names=data.endog_names, endog_scales=impulso.ar1_residual_sd(data.endog)
             )
 
             def model(endog):
                 values = block(endog)  # values.B, values.intercept, values.L
-                ...
+                ...  # the rest of the NumPyro model
 
-            mcmc = numpyro.infer.MCMC(numpyro.infer.NUTS(model), num_warmup=500, num_samples=500)
-            mcmc.run(jax.random.key(0), endog)
+            mcmc = numpyro.infer.MCMC(
+                numpyro.infer.NUTS(model), num_warmup=500, num_samples=500, num_chains=2, chain_method="sequential"
+            )
+            mcmc.run(jax.random.key(0), data.endog)
 
-        To compute impulse responses and forecasts from the samples, turn them
-        into a posterior with the block's `posterior_from_samples` and pass it
-        to `FittedVAR.from_posterior`. The docstring of
-        `CompiledNumPyroBlock.posterior_from_samples` shows the whole sequence.
+            posterior = block.posterior_from_samples(mcmc.get_samples(group_by_chain=True))
+            fitted = FittedVAR.from_posterior(posterior, data, n_lags=2, error_dist=spec.resolved_error_dist)
+            irf = fitted.set_identification_strategy(Cholesky(ordering=data.endog_names)).impulse_response()
+
+        `CompiledNumPyroBlock.posterior_from_samples` turns the samples into a
+        posterior for `FittedVAR.from_posterior`. Its docstring states the
+        two arguments of `FittedVAR.from_posterior` that are the caller's to
+        get right: the `VARData`, which with latent series needs a plug-in
+        column for each, and `error_dist`.
 
         The block's site names are not prefixed. To embed two VARs in one
         NumPyro model, call each block inside its own
@@ -1561,11 +1567,6 @@ class VAR(ImpulsoBaseModel):
         starts at the same point. Inside `numpyro.handlers.scope(prefix=...)`,
         prefix the keys the same way.
 
-        Handing the posterior to `FittedVAR`: `FittedVAR.from_posterior`
-        needs a `VARData`, and with latent series that `VARData` needs a
-        plug-in column for each latent series, such as its posterior-mean
-        path (ADR-0016).
-
         Limitations:
 
         - NumPyro cannot draw the VAR's parameters, because their sites have
@@ -1586,12 +1587,13 @@ class VAR(ImpulsoBaseModel):
           constant volatility; `endog_scales` is required; and latent series
           require Gaussian errors. This method raises them, with
           `build_in_model`'s messages, before compiling anything.
-        - Under JAX the latent-block stationarity constraint computes its
-          non-symmetric eigendecomposition on the CPU. JAX implements that
-          eigendecomposition only for CPU and GPU, and on a GPU it calls
-          LAPACK on the host CPU by default (see `jax.lax.linalg.eig`). On a
-          TPU it does not run. No GPU run has been tested. One latent series
-          with `n_lags=1` has no such constraint.
+        - The `latent_stationarity` Potential computes a non-symmetric
+          eigendecomposition, which JAX implements only for CPU and GPU (see
+          `jax.lax.linalg.eig`); on a GPU it calls LAPACK on the host CPU by
+          default. On a TPU the Potential does not run. No GPU run has been
+          tested. One latent series with `n_lags=1` computes no
+          eigendecomposition: its stationarity constraint is the truncated
+          own lag (ADR-0017).
 
         Importing PyTensor's JAX backend switches JAX to 64-bit floats
         (`jax_enable_x64`) when PyTensor's `floatX` is `float64`, its default.
@@ -1636,9 +1638,8 @@ class VAR(ImpulsoBaseModel):
         import pymc as pm
         import pytensor
         import pytensor.tensor as pt
-        from pymc.sampling.jax import get_jaxified_graph
 
-        from impulso.numpyro_block import UNCONSTRAINED_SITE_PREFIX, CompiledNumPyroBlock, add_with_zero_gradient
+        from impulso.numpyro_block import CompiledNumPyroBlock
 
         # Without `n_endog_rows` the row count is left unknown, so one block
         # accepts an `endog` of any length; JAX fixes it when it traces a
@@ -1666,66 +1667,13 @@ class VAR(ImpulsoBaseModel):
                 "when it compiles them. Pass the number of rows of the endog each call of the block receives."
             )
 
-        inputs = [*model.value_vars, endog]
-        # The log-density sums the priors, the Potentials (the likelihood
-        # `obs` among them) and the transforms' correction terms. The
-        # `latent_stationarity` Potential is 0 inside the stationary region
-        # and -inf outside, so its gradient is zero; PyMC gets that zero from
-        # a gradient override. PyTensor's JAX conversion inlines the override,
-        # and JAX cannot differentiate the eigendecomposition inside it, so
-        # the Potential is compiled on its own and added with a zero gradient.
-        stationarity = [potential for potential in model.potentials if potential.name == _LATENT_STATIONARITY]
-        rest = [*model.basic_RVs, *(potential for potential in model.potentials if potential not in stationarity)]
-        log_density = get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=rest)])
-        if stationarity:
-            log_density = add_with_zero_gradient(
-                log_density, get_jaxified_graph(inputs=inputs, outputs=[model.logp(vars=stationarity)])
-            )
         # The posterior schema reads `nu` exactly when the error distribution
         # is heavy-tailed. The Student-t adapter registers it as the
-        # Deterministic "nu" whether the degrees of freedom are inferred or
+        # Deterministic `nu` whether the degrees of freedom are inferred or
         # fixed.
-        degrees_of_freedom = model["nu"] if self.resolved_error_dist.is_heavy_tailed else None
-        quantities = {
-            INTERCEPT: handles.intercept,
-            COEFFICIENTS: handles.B,
-            EXOG_COEFFICIENTS: handles.B_exog,
-            "L": handles.L,
-            "nu": degrees_of_freedom,
-            "latent": handles.latent,
-        }
-        # A quantity the model does not have (no intercept, no exogenous
-        # regressors, Gaussian errors, no latent series) is not recorded,
-        # and the call returns `None` for it.
-        recorded = {name: quantity for name, quantity in quantities.items() if quantity is not None}
-        site_names = {value.name: f"{UNCONSTRAINED_SITE_PREFIX}{value.name}" for value in model.value_vars}
-        # On the unconstrained scale, keyed by value-variable name. It holds
-        # the stationary start `B` gets with latent series (ADR-0016).
-        initial_point = model.initial_point()
-        # PyMC's own dimension names, or its defaults for a variable it gives
-        # none: `L_dim_0` and `L_dim_1` for `L`, and none for the scalar `nu`.
-        dimension_names = {
-            name: tuple(model.named_vars_to_dims.get(name) or (f"{name}_dim_{i}" for i in range(variable.ndim)))
-            for name, variable in recorded.items()
-        }
-        labelled = {dim for dims in dimension_names.values() for dim in dims if model.coords.get(dim) is not None}
-        return CompiledNumPyroBlock(
-            numpyro_site_names=site_names,
-            # PyMC gives some value variables no static shape (`B`'s among
-            # them), so the shapes come from evaluating the initial point.
-            site_shapes={site_names[name]: np.shape(value) for name, value in initial_point.items()},
-            recorded_names=tuple(recorded),
-            log_density=log_density,
-            # Rewritten in terms of the value variables, undoing their
-            # transforms, so the function reads its inputs instead of drawing.
-            recorded_quantities=get_jaxified_graph(
-                inputs=inputs, outputs=model.replace_rvs_by_values(list(recorded.values()))
-            ),
-            dimension_names=dimension_names,
-            coordinate_labels={dim: tuple(model.coords[dim]) for dim in labelled},
-            initial_point={site_names[name]: value for name, value in initial_point.items()},
-            latent_names=handles.latent_names,
-            n_endog_rows=n_endog_rows,
+        degrees_of_freedom = model[DEGREES_OF_FREEDOM] if self.resolved_error_dist.is_heavy_tailed else None
+        return CompiledNumPyroBlock.from_pymc_model(
+            model, endog, handles, degrees_of_freedom=degrees_of_freedom, n_endog_rows=n_endog_rows
         )
 
     def _build_pymc_model(self, data: VARData) -> tuple[Any, int]:

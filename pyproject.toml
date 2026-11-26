@@ -224,7 +224,6 @@ ignore_names = [
     "__getattr__",    # PEP 562 lazy exports in impulso/__init__.py
     "__dir__",        # PEP 562 dir() for lazy exports
     "writeable",      # ndarray.flags.writeable = False (array freeze)
-    "output_grads",   # PyTensor OpFromGraph pullback/lop_overrides callback signature
 ]
 
 [tool.jupytext]

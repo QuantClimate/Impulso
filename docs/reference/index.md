@@ -8,6 +8,7 @@ source docstrings by Sphinx autodoc.
 
 data
 spec
+numpyro
 stationarity
 causality
 priors

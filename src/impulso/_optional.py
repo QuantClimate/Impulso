@@ -26,13 +26,7 @@ def require(module: str, *, extra: str) -> ModuleType:
         ImportError: If the module is not installed. The message names the
             extra and gives copy-pasteable install commands.
     """
-    try:
-        return importlib.import_module(module)
-    except ImportError as exc:
-        raise ImportError(
-            f"{module} is required for this feature. "
-            f'Install it with: pip install "impulso[{extra}]" or: uv add "impulso[{extra}]"'
-        ) from exc
+    return require_all(module, extra=extra)[0]
 
 
 def require_all(*modules: str, extra: str) -> tuple[ModuleType, ...]:
