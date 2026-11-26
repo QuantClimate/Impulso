@@ -1241,8 +1241,11 @@ dev = [
 ]
 docs = [
     { name = "ipykernel" },
+    { name = "jax", version = "0.10.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "jax", version = "0.12.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "jupytext" },
     { name = "myst-nb" },
+    { name = "numpyro" },
     { name = "qc-core" },
     { name = "shibuya" },
     { name = "sphinx", version = "9.0.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -1298,8 +1301,10 @@ dev = [
 ]
 docs = [
     { name = "ipykernel", specifier = ">=6.29" },
+    { name = "jax", specifier = ">=0.7.0" },
     { name = "jupytext", specifier = ">=1.16" },
     { name = "myst-nb", specifier = ">=1.2" },
+    { name = "numpyro", specifier = ">=0.20" },
     { name = "qc-core", specifier = ">=0.0.1" },
     { name = "shibuya", specifier = ">=2024.10" },
     { name = "sphinx", specifier = ">=8.1" },

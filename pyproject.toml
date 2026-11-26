@@ -82,6 +82,9 @@ dev = [
 ]
 docs = [
     "statsmodels>=0.14.6",
+    # The NumPyro tutorial compiles a VAR to JAX and samples it with NumPyro.
+    "jax>=0.7.0",
+    "numpyro>=0.20",
     "qc-core>=0.0.1",
     "sphinx>=8.1",
     "myst-nb>=1.2",
