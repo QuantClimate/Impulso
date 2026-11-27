@@ -19,6 +19,9 @@ Columns:
                                          that over Indonesia (5N-5S, 90E-140E), normalised (standard deviations)
   food_price_index                       food price index: the World Bank's Food price index, nominal US
                                          dollars, 2010 = 100
+  palm_oil_price, rice_price,            crop prices: the World Bank's prices of palm oil, rice (Thai 5%),
+  soybean_price, maize_price,            soybeans, maize and wheat (US hard red winter), nominal US dollars
+  wheat_price                            per tonne
   consumer_price_index                   consumer price index: US consumer price index for all urban
                                          consumers, all items in U.S. city average, seasonally adjusted,
                                          1982-84 = 100
@@ -42,16 +45,19 @@ Sources and licences:
   Climate Diagnostics Bulletin, Figure T2. National Weather Service
   information "is in the public domain, unless specifically noted otherwise"
   <https://www.weather.gov/disclaimer>.
-- The food price index is from the World Bank Commodity Price Data (the Pink
-  Sheet), file `CMO-Historical-Data-Monthly.xlsx`, sheet "Monthly Indices",
-  column "Food" <https://www.worldbank.org/en/research/commodity-markets>.
+- The food price index and the five crop prices are from the World Bank
+  Commodity Price Data (the Pink Sheet), file
+  `CMO-Historical-Data-Monthly.xlsx`: sheet "Monthly Indices", column "Food",
+  and sheet "Monthly Prices", the columns named in `CROP_PRICES`
+  <https://www.worldbank.org/en/research/commodity-markets>.
   Licensed under Creative Commons Attribution 4.0
   <https://creativecommons.org/licenses/by/4.0/> (World Bank Data Catalog,
   dataset 0038238). The file's address changes with each monthly release; the
   address in `WORLD_BANK_URL` is the release of 3 November 2026. This script
-  changes the series: it averages the monthly values to quarters, and the
-  tutorial then deflates them by the consumer price index and takes 100 times
-  the quarterly change in the logarithm.
+  changes the series: it averages the monthly values to quarters. The tutorial
+  then deflates the food price index by the consumer price index, forms a
+  relative price from the crop prices, and takes 100 times the quarterly
+  change in each logarithm.
 - The consumer price index is series CUSR0000SA0 from the US Bureau of Labor
   Statistics public API <https://www.bls.gov/developers/>; the Bureau's series
   page <https://data.bls.gov/timeseries/CUSR0000SA0> gives its title, "All
@@ -85,6 +91,14 @@ WORLD_BANK_URL = (
 BUREAU_OF_LABOR_STATISTICS_URL = "https://api.bls.gov/publicAPI/v1/timeseries/data/"
 CONSUMER_PRICE_INDEX_SERIES = "CUSR0000SA0"
 USER_AGENT = "Mozilla/5.0 (compatible; impulso-docs-data)"
+# Column label in the Pink Sheet's "Monthly Prices" sheet: column name in the output.
+CROP_PRICES = {
+    "Palm oil": "palm_oil_price",
+    "Rice, Thai 5%": "rice_price",
+    "Soybeans": "soybean_price",
+    "Maize": "maize_price",
+    "Wheat, US HRW": "wheat_price",
+}
 FIRST_YEAR, LAST_YEAR = 1950, 2024
 OUTPUT = Path(__file__).resolve().parents[1] / "docs" / "tutorials" / "data" / "el_nino_commodity_prices.csv"
 
@@ -127,7 +141,7 @@ def _nino_anomalies() -> pd.DataFrame:
     regions = ["nino12", "nino3", "nino4", "nino34"]
     table.columns = ["year", "month"] + [name for r in regions for name in (f"{r}_temperature", r)]
     table.index = pd.PeriodIndex.from_fields(year=table["year"], month=table["month"], freq="M")
-    return table[["nino12", "nino3", "nino4"]]
+    return table.loc[:, ["nino12", "nino3", "nino4"]]
 
 
 def _post_json(url: str, body: dict) -> dict:
@@ -135,7 +149,11 @@ def _post_json(url: str, body: dict) -> dict:
     data = json.dumps(body).encode()
     request = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})  # noqa: S310
     with urllib.request.urlopen(request, timeout=180) as response:  # noqa: S310
-        return json.load(response)
+        reply = response.read()
+    try:
+        return json.loads(reply)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{url} did not return JSON: {reply[:200]!r}") from error
 
 
 def _consumer_price_index() -> pd.Series:
@@ -156,15 +174,25 @@ def _consumer_price_index() -> pd.Series:
     return pd.Series(values).sort_index()
 
 
-def _food_price_index() -> pd.Series:
-    """The food price index, monthly, from the Pink Sheet's "Monthly Indices" sheet."""
-    sheet = pd.read_excel(io.BytesIO(_get(WORLD_BANK_URL)), sheet_name="Monthly Indices", header=None)
-    food_columns = [c for c in sheet.columns if sheet.loc[5:8, c].astype(str).str.strip().eq("Food **").any()]
-    if len(food_columns) != 1:
-        raise ValueError(f"expected one 'Food **' column in the sheet header, found {food_columns}")
+def _pink_sheet_column(sheet: pd.DataFrame, label: str) -> pd.Series:
+    """One monthly column of a Pink Sheet sheet, found by its label in the sheet's header rows."""
+    columns = [c for c in sheet.columns if sheet.loc[3:8, c].astype(str).str.strip().eq(label).any()]
+    if len(columns) != 1:
+        raise ValueError(f"expected one {label!r} column in the sheet header, found {columns}")
     rows = sheet[sheet[0].astype(str).str.fullmatch(r"\d{4}M\d{2}")]
     index = pd.PeriodIndex([pd.Period(year=int(s[:4]), month=int(s[5:]), freq="M") for s in rows[0]])
-    return pd.Series(pd.to_numeric(rows[food_columns[0]].to_numpy(), errors="coerce"), index=index)
+    values = [float("nan") if isinstance(v, str) else float(v) for v in rows.loc[:, columns[0]]]  # text marks a gap
+    return pd.Series(values, index=index)
+
+
+def _world_bank_prices() -> pd.DataFrame:
+    """The food price index and the five crop prices, monthly, from the Pink Sheet."""
+    workbook = _get(WORLD_BANK_URL)
+    indices = pd.read_excel(io.BytesIO(workbook), sheet_name="Monthly Indices", header=None)
+    monthly_prices = pd.read_excel(io.BytesIO(workbook), sheet_name="Monthly Prices", header=None)
+    prices = {"food_price_index": _pink_sheet_column(indices, "Food **")}
+    prices |= {name: _pink_sheet_column(monthly_prices, label) for label, name in CROP_PRICES.items()}
+    return pd.DataFrame(prices)
 
 
 def main() -> None:
@@ -176,11 +204,12 @@ def main() -> None:
     monthly["equatorial_southern_oscillation_index"] = _climate_prediction_center_table(
         _get(EQUATORIAL_SOUTHERN_OSCILLATION_URL).decode()
     )
-    monthly = monthly.join(_food_price_index().rename("food_price_index"), how="outer")
+    monthly = monthly.join(_world_bank_prices(), how="outer")
     monthly = monthly.join(_consumer_price_index().rename("consumer_price_index"), how="outer")
 
-    quarter = monthly.index.asfreq("Q")
-    quarterly = monthly.groupby(quarter).mean().where(monthly.groupby(quarter).count() == 3)
+    quarter = pd.PeriodIndex(monthly.index).asfreq("Q")
+    quarterly = pd.DataFrame(monthly.groupby(quarter).mean())
+    quarterly = quarterly[monthly.groupby(quarter).count() == 3]  # a quarter with a month missing is left empty
     quarterly = quarterly.loc[f"{FIRST_YEAR}Q1" : f"{LAST_YEAR}Q4"]
     quarterly.index = quarterly.index.to_timestamp()
     quarterly.index.name = "quarter_start"
