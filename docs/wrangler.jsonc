@@ -4,9 +4,12 @@
 {
   "name": "impulso-docs",
   "compatibility_date": "2026-09-30",
-  // Serve the docs only on the custom domain, not on workers.dev.
+  // Serve production only on the custom domain, not on workers.dev.
   "workers_dev": false,
-  "preview_urls": false,
+  // PR previews: the `preview-docs` job uploads each PR's build as an
+  // undeployed version, served at pr-<number>-impulso-docs.<subdomain>.workers.dev.
+  // Takes effect at the next `wrangler deploy` (push to main).
+  "preview_urls": true,
   // Cloudflare creates the DNS record and certificate for this hostname.
   "routes": [{ "pattern": "impulso.quantclimate.com", "custom_domain": true }],
   "assets": {
