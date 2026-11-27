@@ -17,6 +17,7 @@ These tutorials walk you through Impulso's core workflow: fitting a Bayesian VAR
 | [Estimating a VAR after March 2020](post-march-2020.py) | Conjugate NIW VAR, COVID volatility break, conditional forecasts, Lenza & Primiceri (2022) replication |
 | [Counterfactuals & Scenario Analysis](scenario-analysis.py) | Historical counterfactuals, conditional forecasts, structural scenarios, plausibility statistics |
 | [A VAR Inside a NumPyro Model](var-in-numpyro.py) | Compiling a VAR for NumPyro, sampling with NumPyro's NUTS, handing the posterior to `FittedVAR` |
+| [El Niño and Food Commodity Prices](el-nino-commodity-prices.py) | An unobserved El Niño factor measured by four climate indices, sampled in a NumPyro model and passed to a compiled VAR as an endogenous series, comparison with Brunner (1998) |
 
 Start with the **Quickstart** if you're new to Impulso, then read **The Minnesota Prior** to understand the shrinkage the Quickstart switched on by default. The Forecasting and Structural Analysis tutorials build on concepts introduced there.
 
@@ -36,4 +37,5 @@ conjugate-var
 post-march-2020
 scenario-analysis
 var-in-numpyro
+el-nino-commodity-prices
 ```
