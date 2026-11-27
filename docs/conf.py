@@ -139,6 +139,12 @@ intersphinx_mapping = {
     "matplotlib": ("https://matplotlib.org/stable/", (None, f"{_INV}/matplotlib.inv")),
 }
 
+# -- Link check --------------------------------------------------------------
+# www.stlouisfed.org did not answer the `docs-linkcheck` job's requests from
+# GitHub's runners within linkcheck's 30-second timeout on two consecutive runs,
+# so the job skips that host.
+linkcheck_ignore = [r"https://www\.stlouisfed\.org/"]
+
 # -- HTML output -------------------------------------------------------------
 html_theme = "shibuya"
 html_title = "impulso"
