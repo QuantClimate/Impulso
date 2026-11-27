@@ -52,7 +52,7 @@ ci = os.environ.get("IMPULSO_DOCS_CI") == "1"
 # `VAR.compile_for_numpyro`, holds the dynamics of the factor, consumer price inflation and the
 # federal funds rate. [A VAR Inside a NumPyro Model](var-in-numpyro.py) explains the compiled
 # NumPyro block; this tutorial uses it without repeating that explanation. The example samples
-# reliably, and it does not remove the price puzzle; the last section says why.
+# reliably, and it does not remove the price puzzle; a later section gives a possible reason.
 
 # %%
 import time
@@ -654,15 +654,15 @@ numbered_table(
 #
 # Each of these statements held in every validation run.
 #
-# ## Why prices rise, and what the prior contributes
+# ## A possible reason prices rise, and what the prior contributes
 #
-# - **The factor contains only real-activity information.** The Federal Reserve raises the
-#   federal funds rate when it expects consumer price inflation to rise. A VAR whose series do
-#   not predict that rise includes the Federal Reserve's response to it in the monetary policy
-#   shock, and the monetary policy shock then appears to raise prices: {cite:t}`sims1992`
-#   traced the price puzzle to this. {cite:t}`bernankeBoivinEliasz2005` summarised 120 series,
-#   prices and financial series among them, by three factors to shrink the price puzzle. Four
-#   real-activity indicators do not contain that information.
+# - **A possible reason: the factor contains only real-activity information.** The Federal
+#   Reserve raises the federal funds rate when it expects consumer price inflation to rise. A
+#   VAR whose series do not predict that rise includes the Federal Reserve's response to it in
+#   the monetary policy shock, and the monetary policy shock then appears to raise prices:
+#   {cite:t}`sims1992` traced the price puzzle to this. {cite:t}`bernankeBoivinEliasz2005`
+#   summarised 120 series, prices and financial series among them, by three factors to shrink
+#   the price puzzle. Four real-activity indicators do not contain that information.
 # - **The prior determines much of the spread of the cross-lag coefficients.** The Cholesky
 #   ordering sets the responses of the factor and of consumer price inflation in the month of
 #   the monetary policy shock to 0, so all their later responses come from the cross-lag
