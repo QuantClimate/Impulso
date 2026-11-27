@@ -325,6 +325,59 @@ jobs:
       - name: Check external links (no notebook execution)
         run: uv run --group docs sphinx-build -b linkcheck -D nb_execution_mode=off docs docs/_build/linkcheck
 
+  preview-docs:
+    # Uploads the PR's smoke render as a new, undeployed version of the
+    # `impulso-docs` Worker. It is served only at a per-PR Version URL on
+    # workers.dev; production changes only in deploy-docs. Fork and Dependabot
+    # PRs get no Cloudflare secrets, so they are skipped.
+    if: >-
+      github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+      && github.actor != 'dependabot[bot]'
+    needs: build-docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      deployments: write
+    # Shows a "View deployment" link on the PR.
+    environment:
+      name: docs-preview
+      url: ${{ steps.upload.outputs.url }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Download the smoke render
+        uses: actions/download-artifact@v8
+        with:
+          name: docs-smoke-render
+          path: docs/_build/html
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Upload a preview version to Cloudflare
+        id: upload
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.ndjson
+        run: |
+          npx --yes wrangler@4.145.0 versions upload --config docs/wrangler.jsonc \
+            --preview-alias "pr-${{ github.event.pull_request.number }}"
+          url=$(jq -r 'select(.type == "version-upload") | .preview_alias_url // empty' "$WRANGLER_OUTPUT_FILE_PATH")
+          if [ -z "$url" ]; then
+            echo "::error::No Version URL returned. Version URLs are enabled by the first push-to-main deploy with preview_urls: true in docs/wrangler.jsonc."
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Docs preview (smoke render): $url" >> "$GITHUB_STEP_SUMMARY"
+
   deploy-docs:
     # Cloudflare serves the docs as the static assets of the `impulso-docs`
     # Worker (docs/wrangler.jsonc). The token lives only in this job.
