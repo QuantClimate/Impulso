@@ -1,0 +1,7 @@
+name,fred_md_mnemonic,description,source,fred_md_transformation_code,transformation_code,unit
+industrial_production,INDPRO,Industrial production: total index,Federal Reserve Board,5,5,percent change from the previous month
+payroll_employment,PAYEMS,"Payroll employment: all employees, total nonfarm",Bureau of Labor Statistics,5,5,percent change from the previous month
+real_personal_income_less_transfers,W875RX1,Real personal income less transfers,Bureau of Economic Analysis,5,5,percent change from the previous month
+real_manufacturing_trade_sales,CMRMTSPLx,Real manufacturing and trade sales,"Federal Reserve Bank of St. Louis, spliced from two Bureau of Economic Analysis series",5,5,percent change from the previous month
+consumer_price_inflation,CPIAUCSL,Consumer price index: all items,Bureau of Labor Statistics,6,5,percent change from the previous month
+federal_funds_rate,FEDFUNDS,Effective federal funds rate,Federal Reserve Board,2,1,percent
